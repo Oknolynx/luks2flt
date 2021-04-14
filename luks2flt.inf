@@ -1,0 +1,50 @@
+;
+; luks2flt.inf
+;
+
+[Version]
+Signature = "$WINDOWS NT$"
+Class = Volume
+ClassGuid = {71a27cdd-812a-11d0-bec7-08002be2092f}
+Provider = %ManufacturerName%
+DriverVer = 04/13/2021,0.2.0.0
+CatalogFile = luks2flt.cat
+PnpLockDown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12 ; %SystemRoot%\system32\drivers
+Luks2CopyFiles = 12 ; %SystemRoot%\system32\drivers
+
+[DefaultInstall.NTamd64]
+CopyFiles = Luks2CopyFiles
+AddReg = Luks2AddReg
+
+[DefaultInstall.NTamd64.Services]
+AddService = %ServiceName%,,Luks2Service
+
+[Luks2Service]
+DisplayName      = %ServiceName%
+Description      = %ServiceDescription%
+ServiceBinary    = %12%\luks2flt.sys ; %SystemRoot%\system32\drivers
+ServiceType      = 1 ; SERVICE_KERNEL_DRIVER
+StartType        = 0 ; SERVICE_BOOT_START ;1 ; SERVICE_SYSTEM_START
+ErrorControl     = 1 ; SERVICE_ERROR_NORMAL
+LoadOrderGroup   = "Filter"
+
+[Luks2AddReg]
+HKLM,"System\CurrentControlSet\Control\Class\{71a27cdd-812a-11d0-bec7-08002be2092f}","LowerFilters",0x00010008,"luks2flt" ; the Volume class
+
+[Luks2CopyFiles]
+luks2flt.sys
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+luks2flt.sys = 1
+
+[Strings]
+ManufacturerName = "Max von Forell"
+DiskName = "Luks2 Installation Disk"
+ServiceName = "luks2flt"
+ServiceDescription = "Luks2 driver"
