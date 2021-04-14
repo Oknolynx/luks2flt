@@ -4,9 +4,23 @@
 #pragma alloc_text(INIT, DriverEntry)
 #endif
 
-/* Global variables */
-PDEVICE_OBJECT Luks2Device;
+/* === Global variables === */
+// The device objects this driver has created.
+PDEVICE_OBJECT gDeviceObjects[LUKS2FLT_MAX_DEVICES];
 
+// The number of device objects this driver has created.
+UINT16 gDeviceObjectCount;
+
+/* a FAST_MUTEX must be 8-byte aligned on 64-bit platforms, see
+ * https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-exinitializefastmutex
+ */
+// Mutex for accessing gDeviceObjects.
+__declspec(align(8)) FAST_MUTEX gDeviceObjectsMutex;
+
+// Mutex for accessing gDeviceObjectCount.
+__declspec(align(8)) FAST_MUTEX gDeviceObjectCountMutex;
+
+/* === Driver routine implementations === */
 _Use_decl_annotations_
 NTSTATUS
 DriverEntry(
@@ -27,6 +41,9 @@ Return Value:
 
     DEBUG("luks2flt!DriverEntry called\n");
 
+    IRQL_ASSERT(PASSIVE_LEVEL);
+
+    // === Initialize driver routines ===
     DriverObject->DriverUnload = Luks2FltUnload;
     // this driver doesn't have a StartIo() routine because it passes IRPs down to the next driver
     // after applying small changes. See also
@@ -62,6 +79,12 @@ Return Value:
     DriverObject->MajorFunction[IRP_MJ_SET_QUOTA] =
     DriverObject->MajorFunction[IRP_MJ_PNP] = Luks2FltDispatchPassthrough;
 
+    // === Initialize global variables ===
+    RtlZeroMemory(gDeviceObjects, sizeof(gDeviceObjects));
+    gDeviceObjectCount = 0;
+    ExInitializeFastMutex(&gDeviceObjectsMutex);
+    ExInitializeFastMutex(&gDeviceObjectCountMutex);
+
     return STATUS_SUCCESS;
 }
 
@@ -78,47 +101,95 @@ Arguments:
     DriverObject - the driver's driver object.
     DeviceObject - a physical device object created by a lower-level driver.
 Return Value:
-    If IoCreateDevice() fails, its error code is returned. If IoAttachDeviceToDeviceStack() fails, STATUS_DEVICE_NOT_CONNECTED
-    is returned. Else STATUS_SUCCESS is returned.
+    If IoCreateDevice() fails, its error code is returned. If the driver has already created LUKS2FLT_MAX_DEVICES device objects,
+    IoAttachDeviceToDeviceStack() fails or the lower device in the device stack has neither one of the DO_DIRECT_IO and DO_BUFFERED_IO
+    flags set, STATUS_DRIVER_INTERNAL_ERROR is returned. Else STATUS_SUCCESS is returned.
 --*/
 {
-    UNREFERENCED_PARAMETER(DriverObject);
-    UNREFERENCED_PARAMETER(DeviceObject);
-
     DEBUG("luks2flt!AddDevice called\n");
 
-    NTSTATUS Status;
-    UNICODE_STRING DeviceName;
-    PDEVICE_OBJECT NextLowerDevice;
+    // TODO maybe read the first sector of the device and only attach when it contains a valid LUKS2 header?
 
-    RtlInitUnicodeString(&DeviceName, DEVICE_NAME_PREFIX);
+    IRQL_ASSERT(PASSIVE_LEVEL);
+
+    NTSTATUS Status;
+    PDEVICE_OBJECT NextLowerDevice;
+    UINT16 DeviceObjectNumber;
+
+    /* === Get number of new device === */
+    ExAcquireFastMutex(&gDeviceObjectCountMutex);
+    if (gDeviceObjectCount < LUKS2FLT_MAX_DEVICES - 1) {
+        DeviceObjectNumber = gDeviceObjectCount++;
+    } else {
+        DEBUG("luks2flt!AddDevice: ERROR - gDeviceObjectCount already equal to LUKS2FLT_MAX_DEVICES!\n");
+        ExReleaseFastMutex(&gDeviceObjectCountMutex);
+        return STATUS_DRIVER_INTERNAL_ERROR;
+    }
+    ExReleaseFastMutex(&gDeviceObjectCountMutex);
+
+    /* === Create new device === */
+    ExAcquireFastMutex(&gDeviceObjectsMutex);
+    // we are now running at IRQL = APC_LEVEL until we release the mutex (see
+    // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/fast-mutexes-and-guarded-mutexes).
+    // all following function calls can run at that IRQL, except for IoDetachDevice(), which is why
+    // we ensure it is called after releasing the mutex
+
+    // "WDM filter and function drivers do not name their device objects." (from
+    // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-iocreatedevice)
     Status = IoCreateDevice(
         DriverObject,
         sizeof(LUKS2FLT_DEVICE_EXTENSION),
-        &DeviceName,
+        NULL,
         FILE_DEVICE_DISK,
         FILE_DEVICE_SECURE_OPEN,
         FALSE,
-        &Luks2Device
+        gDeviceObjects + DeviceObjectNumber
     );
 
     if (!NT_SUCCESS(Status)) {
+        ExReleaseFastMutex(&gDeviceObjectsMutex);
         return Status;
     }
 
+    DEBUG("luks2flt!AddDevice: DEBUG - created device object at %p\n", gDeviceObjects[DeviceObjectNumber]);
+
+    /* === Attach device === */
     NextLowerDevice = IoAttachDeviceToDeviceStack(
-        Luks2Device,
+        gDeviceObjects[DeviceObjectNumber],
         DeviceObject
     );
 
     if (NextLowerDevice == NULL) {
-        IoDeleteDevice(Luks2Device);
-        return STATUS_DEVICE_NOT_CONNECTED;
+        DEBUG("luks2flt!AddDevice: ERROR - IoAttachDeviceToDeviceStack() returned NULL!\n");
+        IoDeleteDevice(gDeviceObjects[DeviceObjectNumber]);
+        ExReleaseFastMutex(&gDeviceObjectsMutex);
+        return STATUS_DRIVER_INTERNAL_ERROR;
     }
 
-    RtlZeroMemory(Luks2Device->DeviceExtension, sizeof(LUKS2FLT_DEVICE_EXTENSION));
-    PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)Luks2Device->DeviceExtension;
+    DEBUG("luks2flt!AddDevice: DEBUG - attached to NextLowerDevice=%p\n", NextLowerDevice);
+
+    /* === Set up device flags === */
+    // see https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/initializing-a-device-object
+    gDeviceObjects[DeviceObjectNumber]->Flags &= !DO_DEVICE_INITIALIZING;
+    if (NextLowerDevice->Flags & DO_DIRECT_IO) {
+        gDeviceObjects[DeviceObjectNumber]->Flags |= DO_DIRECT_IO;
+    } else if (NextLowerDevice->Flags & DO_BUFFERED_IO) {
+        gDeviceObjects[DeviceObjectNumber]->Flags |= DO_BUFFERED_IO;
+    } else {
+        DEBUG("luks2flt!AddDevice: ERROR - NextLowerDevice has neither DO_DIRECT_IO nor DO_BUFFERED_IO set!\n");
+        IoDeleteDevice(gDeviceObjects[DeviceObjectNumber]);
+        ExReleaseFastMutex(&gDeviceObjectsMutex);
+        // IoDetachDevice must run at IRQL = PASSIVE_LEVEL and therefore needs to be called after releasing the mutex
+        IoDetachDevice(NextLowerDevice);
+        return STATUS_DRIVER_INTERNAL_ERROR;
+    }
+
+    /* === Initialize device extension === */
+    RtlZeroMemory(gDeviceObjects[DeviceObjectNumber]->DeviceExtension, sizeof(LUKS2FLT_DEVICE_EXTENSION));
+    PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)gDeviceObjects[DeviceObjectNumber]->DeviceExtension;
     DevExt->NextLowerDevice = NextLowerDevice;
+
+    ExReleaseFastMutex(&gDeviceObjectsMutex);
 
     return STATUS_SUCCESS;
 }
@@ -139,12 +210,39 @@ Return Value:
     The same as the returned value of the call to the driver of the next lower device.
 --*/
 {
+    NTSTATUS Status;
+    UCHAR MinorFunction;
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
-    DEBUG("luks2!DispatchPassthrough called with major function=0x%02x\n", stack->MajorFunction);
+    // suppress calls that happen *a lot*
+    //if ((stack->MajorFunction != IRP_MJ_CREATE) && (stack->MajorFunction != IRP_MJ_CLOSE) && (stack->MajorFunction != IRP_MJ_READ) &&
+    //    (stack->MajorFunction != IRP_MJ_WRITE) && (stack->MajorFunction != IRP_MJ_DEVICE_CONTROL) && (stack->MajorFunction != IRP_MJ_CLEANUP))
+    //    DEBUG("luks2flt!DispatchPassthrough called with major function=0x%02x, minor function=0x%02x\n", stack->MajorFunction, stack->MinorFunction);
+    MinorFunction = stack->MinorFunction;
 
     PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    // this is ok because we don't modify the IRP and don't register a completion routine. if we did
+    // either of that, we'd have to use IoCopyCurrentIrpStackLocationToNext()
     IoSkipCurrentIrpStackLocation(Irp);
-    return IoCallDriver(DevExt->NextLowerDevice, Irp);
+    Status = IoCallDriver(DevExt->NextLowerDevice, Irp);
+
+    if (MinorFunction == IRP_MN_REMOVE_DEVICE) {
+        // a DispatchPnp() routine should always be called at IRQL = PASSIVE_LEVEL, according to
+        // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/dispatch-routines-and-irqls,
+        // therefore we can detach the device and acquire the mutex
+        IoDetachDevice(DevExt->NextLowerDevice);
+
+        ExAcquireFastMutex(&gDeviceObjectCountMutex);
+        for (int i = 0; i < LUKS2FLT_MAX_DEVICES; ++i) {
+            if (gDeviceObjects[i] == DeviceObject) {
+                IoDeleteDevice(gDeviceObjects[i]);
+                gDeviceObjects[i] = NULL;
+                break;
+            }
+        }
+        ExReleaseFastMutex(&gDeviceObjectCountMutex);
+    }
+
+    return Status;
 }
 
 _Use_decl_annotations_
@@ -162,5 +260,9 @@ Return Value:
 --*/
 {
     UNREFERENCED_PARAMETER(DriverObject);
+
+    DEBUG("luks2flt!Unload called\n");
+
+    IRQL_ASSERT(PASSIVE_LEVEL);
     // nothing to free yet
 }
