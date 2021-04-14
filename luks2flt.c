@@ -7,10 +7,11 @@
 /* Global variables */
 PDEVICE_OBJECT Luks2Device;
 
+_Use_decl_annotations_
 NTSTATUS
 DriverEntry(
-    _In_ PDRIVER_OBJECT DriverObject,
-    _In_ PUNICODE_STRING RegistryPath
+    PDRIVER_OBJECT DriverObject,
+    PUNICODE_STRING RegistryPath
 )
 /*++
 Routine Description:
@@ -26,46 +27,49 @@ Return Value:
 
     DEBUG("luks2flt!DriverEntry called\n");
 
+    DriverObject->DriverUnload = Luks2FltUnload;
+    // this driver doesn't have a StartIo() routine because it passes IRPs down to the next driver
+    // after applying small changes. See also
+    // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/writing-a-startio-routine
+    DriverObject->DriverStartIo = NULL;
     DriverObject->DriverExtension->AddDevice = Luks2FltAddDevice;
-    DriverObject->MajorFunction[IRP_MJ_CREATE] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_CREATE_NAMED_PIPE] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_CLOSE] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_READ] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_WRITE] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_QUERY_INFORMATION] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_SET_INFORMATION] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_QUERY_EA] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_SET_EA] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_FLUSH_BUFFERS] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_QUERY_VOLUME_INFORMATION] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_SET_VOLUME_INFORMATION] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_DIRECTORY_CONTROL] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_FILE_SYSTEM_CONTROL] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_SHUTDOWN] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_LOCK_CONTROL] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_CLEANUP] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_CREATE_MAILSLOT] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_QUERY_SECURITY] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_SET_SECURITY] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_POWER] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_SYSTEM_CONTROL] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_DEVICE_CHANGE] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_QUERY_QUOTA] = Luks2FltDispatchPassthrough;
-    DriverObject->MajorFunction[IRP_MJ_SET_QUOTA] = Luks2FltDispatchPassthrough;
+    DriverObject->MajorFunction[IRP_MJ_CREATE] =
+    DriverObject->MajorFunction[IRP_MJ_CREATE_NAMED_PIPE] =
+    DriverObject->MajorFunction[IRP_MJ_CLOSE] =
+    DriverObject->MajorFunction[IRP_MJ_READ] =
+    DriverObject->MajorFunction[IRP_MJ_WRITE] =
+    DriverObject->MajorFunction[IRP_MJ_QUERY_INFORMATION] =
+    DriverObject->MajorFunction[IRP_MJ_SET_INFORMATION] =
+    DriverObject->MajorFunction[IRP_MJ_QUERY_EA] =
+    DriverObject->MajorFunction[IRP_MJ_SET_EA] =
+    DriverObject->MajorFunction[IRP_MJ_FLUSH_BUFFERS] =
+    DriverObject->MajorFunction[IRP_MJ_QUERY_VOLUME_INFORMATION] =
+    DriverObject->MajorFunction[IRP_MJ_SET_VOLUME_INFORMATION] =
+    DriverObject->MajorFunction[IRP_MJ_DIRECTORY_CONTROL] =
+    DriverObject->MajorFunction[IRP_MJ_FILE_SYSTEM_CONTROL] =
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] =
+    DriverObject->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] =
+    DriverObject->MajorFunction[IRP_MJ_SHUTDOWN] =
+    DriverObject->MajorFunction[IRP_MJ_LOCK_CONTROL] =
+    DriverObject->MajorFunction[IRP_MJ_CLEANUP] =
+    DriverObject->MajorFunction[IRP_MJ_CREATE_MAILSLOT] =
+    DriverObject->MajorFunction[IRP_MJ_QUERY_SECURITY] =
+    DriverObject->MajorFunction[IRP_MJ_SET_SECURITY] =
+    DriverObject->MajorFunction[IRP_MJ_POWER] =
+    DriverObject->MajorFunction[IRP_MJ_SYSTEM_CONTROL] =
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CHANGE] =
+    DriverObject->MajorFunction[IRP_MJ_QUERY_QUOTA] =
+    DriverObject->MajorFunction[IRP_MJ_SET_QUOTA] =
     DriverObject->MajorFunction[IRP_MJ_PNP] = Luks2FltDispatchPassthrough;
-
-    // TODO (?)
-    // DriverObject->FastIoDispatch = &Luks2FastIoDispatch;
 
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 Luks2FltAddDevice(
-    _In_ PDRIVER_OBJECT DriverObject,
-    _In_ PDEVICE_OBJECT DeviceObject
+    PDRIVER_OBJECT DriverObject,
+    PDEVICE_OBJECT DeviceObject
 )
 /*++
 Routine Description:
@@ -87,7 +91,7 @@ Return Value:
     UNICODE_STRING DeviceName;
     PDEVICE_OBJECT NextLowerDevice;
 
-    RtlInitUnicodeString(&DeviceName, DEVICE_NAME);
+    RtlInitUnicodeString(&DeviceName, DEVICE_NAME_PREFIX);
     Status = IoCreateDevice(
         DriverObject,
         sizeof(LUKS2FLT_DEVICE_EXTENSION),
@@ -119,6 +123,7 @@ Return Value:
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
 Luks2FltDispatchPassthrough(
     PDEVICE_OBJECT DeviceObject,
@@ -140,4 +145,22 @@ Return Value:
     PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
     IoSkipCurrentIrpStackLocation(Irp);
     return IoCallDriver(DevExt->NextLowerDevice, Irp);
+}
+
+_Use_decl_annotations_
+VOID
+Luks2FltUnload(
+    PDRIVER_OBJECT DriverObject
+)
+/*++
+Routine Description:
+    Cleanup and free all allocated memory.
+Arguments:
+    DriverObject - the driver object created by the system.
+Return Value:
+    None.
+--*/
+{
+    UNREFERENCED_PARAMETER(DriverObject);
+    // nothing to free yet
 }
