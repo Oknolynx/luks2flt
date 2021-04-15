@@ -77,7 +77,7 @@ Return Value:
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CHANGE] =
     DriverObject->MajorFunction[IRP_MJ_QUERY_QUOTA] =
     DriverObject->MajorFunction[IRP_MJ_SET_QUOTA] =
-    DriverObject->MajorFunction[IRP_MJ_PNP] = Luks2FltDispatchPassthrough;
+    DriverObject->MajorFunction[IRP_MJ_PNP] = Luks2FltDispatchGeneric;
 
     // === Initialize global variables ===
     RtlZeroMemory(gDeviceObjects, sizeof(gDeviceObjects));
@@ -96,7 +96,7 @@ Luks2FltAddDevice(
 )
 /*++
 Routine Description:
-    Creates a new device object and attaches it to the given device object's device stack.
+    Create a new device object and attach it to the given device object's device stack.
 Arguments:
     DriverObject - the driver's driver object.
     DeviceObject - a physical device object created by a lower-level driver.
@@ -107,8 +107,6 @@ Return Value:
 --*/
 {
     DEBUG("luks2flt!AddDevice called\n");
-
-    // TODO maybe read the first sector of the device and only attach when it contains a valid LUKS2 header?
 
     IRQL_ASSERT(PASSIVE_LEVEL);
 
@@ -170,12 +168,16 @@ Return Value:
 
     /* === Set up device flags === */
     // see https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/initializing-a-device-object
-    gDeviceObjects[DeviceObjectNumber]->Flags &= !DO_DEVICE_INITIALIZING;
+    gDeviceObjects[DeviceObjectNumber]->Flags &= ~DO_DEVICE_INITIALIZING;
     if (NextLowerDevice->Flags & DO_DIRECT_IO) {
         gDeviceObjects[DeviceObjectNumber]->Flags |= DO_DIRECT_IO;
-    } else if (NextLowerDevice->Flags & DO_BUFFERED_IO) {
+        DEBUG("luks2flt!AddDevice: DEBUG - matching lower device and setting DO_DIRECT_IO flag\n");
+    }
+    else if (NextLowerDevice->Flags & DO_BUFFERED_IO) {
         gDeviceObjects[DeviceObjectNumber]->Flags |= DO_BUFFERED_IO;
-    } else {
+        DEBUG("luks2flt!AddDevice: DEBUG - matching lower device and setting DO_BUFFERED_IO flag\n");
+    }
+    else {
         DEBUG("luks2flt!AddDevice: ERROR - NextLowerDevice has neither DO_DIRECT_IO nor DO_BUFFERED_IO set!\n");
         IoDeleteDevice(gDeviceObjects[DeviceObjectNumber]);
         ExReleaseFastMutex(&gDeviceObjectsMutex);
@@ -188,10 +190,44 @@ Return Value:
     RtlZeroMemory(gDeviceObjects[DeviceObjectNumber]->DeviceExtension, sizeof(LUKS2FLT_DEVICE_EXTENSION));
     PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)gDeviceObjects[DeviceObjectNumber]->DeviceExtension;
     DevExt->NextLowerDevice = NextLowerDevice;
+    DevExt->IsLuks2Volume = FALSE;
 
     ExReleaseFastMutex(&gDeviceObjectsMutex);
 
     return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+NTSTATUS
+Luks2FltDispatchGeneric(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+)
+/*++
+Routine Description:
+    Default dispatch routine that either calls Luks2FltDispatchPassthrough() or the appropriate routine for LUKS2 volumes
+    or completes the request, marking it as invalid, depending on whether the IsLuks2Volume flag in the device extension is set.
+Arguments:
+    DeviceObject - the device object for the target device.
+    IRP - the IRP desribing the requested IO operation.
+Return Value:
+    If IsLuks2Volume is FALSE, the return value of Luks2FltDispatchPassthrough(); else the value of the appropriate LUKS2 dispatch routine
+    or STATUS_INVALID_DEVICE_REQUEST.
+--*/
+{
+    PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
+
+    switch (Stack->MajorFunction) {
+    case IRP_MJ_DEVICE_CONTROL:
+        if ((DevExt->IsLuks2Volume) || (Stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_LUKS2FLT_SET_LUKS2_INFO))
+            return Luks2FltDispatchDeviceControl(DeviceObject, Irp);
+    }
+
+    if (DevExt->IsLuks2Volume) {
+        return CompleteInvalidIrp(Irp);
+    }
+    return Luks2FltDispatchPassthrough(DeviceObject, Irp);
 }
 
 _Use_decl_annotations_
@@ -202,7 +238,7 @@ Luks2FltDispatchPassthrough(
 )
 /*++
 Routine Description:
-    Default dispatch method that passes the received IRP on to the next driver in the stack, untouched.
+    Dispatch routine that passes the received IRP on to the next driver in the stack, untouched.
 Arguments:
     DeviceObject - the device object for the target device.
     IRP - the IRP desribing the requested IO operation.
@@ -212,12 +248,12 @@ Return Value:
 {
     NTSTATUS Status;
     UCHAR MinorFunction;
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+    PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
     // suppress calls that happen *a lot*
     //if ((stack->MajorFunction != IRP_MJ_CREATE) && (stack->MajorFunction != IRP_MJ_CLOSE) && (stack->MajorFunction != IRP_MJ_READ) &&
     //    (stack->MajorFunction != IRP_MJ_WRITE) && (stack->MajorFunction != IRP_MJ_DEVICE_CONTROL) && (stack->MajorFunction != IRP_MJ_CLEANUP))
     //    DEBUG("luks2flt!DispatchPassthrough called with major function=0x%02x, minor function=0x%02x\n", stack->MajorFunction, stack->MinorFunction);
-    MinorFunction = stack->MinorFunction;
+    MinorFunction = Stack->MinorFunction;
 
     PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
     // this is ok because we don't modify the IRP and don't register a completion routine. if we did
@@ -226,6 +262,8 @@ Return Value:
     Status = IoCallDriver(DevExt->NextLowerDevice, Irp);
 
     if (MinorFunction == IRP_MN_REMOVE_DEVICE) {
+        DEBUG("luks2flt!DispatchPassthrough: DEBUG - received IRP_MN_REMOVE_DEVICE for device object %p\n", DeviceObject);
+
         // a DispatchPnp() routine should always be called at IRQL = PASSIVE_LEVEL, according to
         // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/dispatch-routines-and-irqls,
         // therefore we can detach the device and acquire the mutex
@@ -243,6 +281,48 @@ Return Value:
     }
 
     return Status;
+}
+
+_Use_decl_annotations_
+NTSTATUS
+Luks2FltDispatchDeviceControl(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+)
+/*++
+Routine Description:
+    Dispatch method that passes the received IRP on to the next driver in the stack, untouched.
+Arguments:
+    DeviceObject - the device object for the target device.
+    IRP - the IRP desribing the requested IO operation.
+Return Value:
+    The same as the returned value of the call to the driver of the next lower device.
+--*/
+{
+    PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
+    PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+
+    if (Stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_LUKS2FLT_SET_LUKS2_INFO) {
+        DEBUG("luks2flt!DispatchDeviceControl: DEBUG - got IOCTL_LUKS2FLT_SET_LUKS2_INFO\n");
+
+        // the IOCTL uses buffered IO, therefore Buffer is a system buffer. this means it doesn't need to be locked and can be accessed directly
+        PVOID Buffer = Irp->AssociatedIrp.SystemBuffer;
+        DevExt->IsLuks2Volume = ((PBOOLEAN)Buffer)[0];
+
+        if (DevExt->IsLuks2Volume) {
+            DEBUG("luks2flt!DispatchDeviceControl: DEBUG - set IsLuks2Volume to TRUE\n");
+        } else {
+            DEBUG("luks2flt!DispatchDeviceControl: DEBUG - set IsLuks2Volume to FALSE\n");
+        }
+
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        Irp->IoStatus.Information = DevExt->IsLuks2Volume;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+        return STATUS_SUCCESS;
+    }
+
+    return CompleteInvalidIrp(Irp);
 }
 
 _Use_decl_annotations_
@@ -265,4 +345,24 @@ Return Value:
 
     IRQL_ASSERT(PASSIVE_LEVEL);
     // nothing to free yet
+}
+
+NTSTATUS
+CompleteInvalidIrp(
+    _In_ PIRP Irp
+)
+/*++
+Routine Description:
+    Mark the given IRP as invalid and complete it.
+Arguments:
+    Irp - the IRP to be completed.
+Return Value:
+    Always STATUS_INVALID_DEVICE_REQUEST.
+--*/
+{
+    Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+    return STATUS_INVALID_DEVICE_REQUEST;
 }
