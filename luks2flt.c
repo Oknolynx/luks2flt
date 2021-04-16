@@ -219,9 +219,18 @@ Return Value:
     PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
 
     switch (Stack->MajorFunction) {
+    case IRP_MJ_CREATE:
+    case IRP_MJ_CLOSE:
+        if (DevExt->IsLuks2Volume)
+            return Luks2FltDispatchCreateClose(DeviceObject, Irp);
     case IRP_MJ_DEVICE_CONTROL:
         if ((DevExt->IsLuks2Volume) || (Stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_LUKS2FLT_SET_LUKS2_INFO))
             return Luks2FltDispatchDeviceControl(DeviceObject, Irp);
+    case IRP_MJ_CLEANUP:
+        if (DevExt->IsLuks2Volume)
+            return Luks2FltDispatchCleanup(DeviceObject, Irp);
+    default:
+        break;
     }
 
     if (DevExt->IsLuks2Volume) {
@@ -285,18 +294,58 @@ Return Value:
 
 _Use_decl_annotations_
 NTSTATUS
+Luks2FltDispatchCreateClose(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+)
+/*++
+Routine Description:
+    Dispatch method for IRP_MJ_CREATE and IRP_MJ_CLOSE. Just calls DispatchPassthrough().
+Arguments:
+    DeviceObject - the device object for the target device.
+    IRP - the IRP desribing the requested IO operation.
+Return Value:
+    The same as the returned value of the call to the driver of the next lower device.
+--*/
+{
+    // Regarding IRP_MJ_CREATE:
+    // https://docs.microsoft.com/en-us/windows-hardware/drivers/ifs/irp-mj-create says:
+    // "If the target device object is the filter driver's control device object, the filter driver's dispatch routine must complete the IRP
+    // and return an appropriate NTSTATUS value, after setting Irp->IoStatus.Status and Irp->IoStatus.Information to appropriate values.
+    //
+    // Otherwise, the filter driver should perform any needed processingand, depending on the nature of the filter, either complete the IRP
+    // or pass it down to the next - lower driver on the stack."
+    //
+    // However, I'm not sure what they mean by "the target device" -- the DeviceObject parameter is always a device object created by this driver
+    // and the device object in the IRP's stack location for this driver seems to always be the same object. As this driver does not support
+    // opening its devices, we just pass the request to the next lower driver -- either the request was not meant for us and we should pass it on
+    // or it was meant for us and the drivers below will notice that and fail the request.
+
+    // Regarding IRP_MJ_CLOSE:
+    // As we don't do anything for IRP_MJ_CREATE, we also just pass on IRP_MJ_CLOSE requests.
+
+    // Regarding both:
+    // Decompiling the FveFilterCreate() and FveFilterClose() routines of the fvevol driver shows that (apart from some cases that are guarded
+    // by checking values in the device extension and are thus out of my reach to understand) they also just pass create and close requests
+    // down the stack. Therefore this should be fine.
+
+    return Luks2FltDispatchPassthrough(DeviceObject, Irp);
+}
+
+_Use_decl_annotations_
+NTSTATUS
 Luks2FltDispatchDeviceControl(
     PDEVICE_OBJECT DeviceObject,
     PIRP Irp
 )
 /*++
 Routine Description:
-    Dispatch method that passes the received IRP on to the next driver in the stack, untouched.
+    Dispatch method for IRP_MJ_DEVICE_CONTROL. Handles IOCTL_LUKS2FLT_SET_LUKS2_INFO and fails all other IOCTLs.
 Arguments:
     DeviceObject - the device object for the target device.
     IRP - the IRP desribing the requested IO operation.
 Return Value:
-    The same as the returned value of the call to the driver of the next lower device.
+    STATUS_SUCCESS for IOCTL_LUKS2FLT_SET_LUKS2_INFO, STATUS_INVALID_DEVICE_REQUEST for all other IOCTLs.
 --*/
 {
     PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
@@ -322,7 +371,30 @@ Return Value:
         return STATUS_SUCCESS;
     }
 
+    // TODO register completion routines for all IOCTLs that return information including volume size and location,
+    // i. e. IOCTL_DISK_GET_PARTITION_INFO(_EX), to modify the returned values and pass down all IRPs.
+
     return CompleteInvalidIrp(Irp);
+}
+
+_Use_decl_annotations_
+NTSTATUS
+Luks2FltDispatchCleanup(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+)
+/*++
+Routine Description:
+    Dispatch method for IRP_MJ_CLEANUP. Just calls DispatchPassthrough().
+Arguments:
+    DeviceObject - the device object for the target device.
+    IRP - the IRP desribing the requested IO operation.
+Return Value:
+    The same as the returned value of the call to the driver of the next lower device.
+--*/
+{
+    // The same reasoning as for IRP_MJ_CREATE and IRP_MJ_CLOSE applies.
+    return Luks2FltDispatchPassthrough(DeviceObject, Irp);
 }
 
 _Use_decl_annotations_

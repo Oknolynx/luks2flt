@@ -21,7 +21,9 @@ DRIVER_UNLOAD     Luks2FltUnload;
 _Dispatch_type_(IRP_MJ_PNP)
 DRIVER_DISPATCH   Luks2FltDispatchGeneric;
 DRIVER_DISPATCH   Luks2FltDispatchPassthrough;
+DRIVER_DISPATCH   Luks2FltDispatchCreateClose;
 DRIVER_DISPATCH   Luks2FltDispatchDeviceControl;
+DRIVER_DISPATCH   Luks2FltDispatchCleanup;
 
 NTSTATUS
 CompleteInvalidIrp(
