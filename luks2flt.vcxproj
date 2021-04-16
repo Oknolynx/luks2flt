@@ -117,6 +117,7 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
     <RunCodeAnalysis>true</RunCodeAnalysis>
+    <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
@@ -143,7 +144,9 @@
     <ClInclude Include="luks2flt.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="aes.c" />
     <ClCompile Include="luks2flt.c" />
+    <ClCompile Include="xts.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

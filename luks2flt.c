@@ -11,6 +11,9 @@ PDEVICE_OBJECT gDeviceObjects[LUKS2FLT_MAX_DEVICES];
 // The number of device objects this driver has created.
 UINT16 gDeviceObjectCount;
 
+// A lookaside sist used for (de)allocations of LUKS2FLT_READ_CONTEXTs. Must be aligned to 16 bytes.
+__declspec(align(16)) LOOKASIDE_LIST_EX gReadContextList;
+
 /* a FAST_MUTEX must be 8-byte aligned on 64-bit platforms, see
  * https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-exinitializefastmutex
  */
@@ -84,6 +87,16 @@ Return Value:
     gDeviceObjectCount = 0;
     ExInitializeFastMutex(&gDeviceObjectsMutex);
     ExInitializeFastMutex(&gDeviceObjectCountMutex);
+    ExInitializeLookasideListEx(
+        &gReadContextList,
+        NULL,
+        NULL,
+        NonPagedPoolNx,
+        0,
+        sizeof(LUKS2FLT_READ_CONTEXT),
+        READCTX_TAG,
+        0
+    );
 
     return STATUS_SUCCESS;
 }
@@ -198,6 +211,29 @@ Return Value:
 }
 
 _Use_decl_annotations_
+VOID
+Luks2FltUnload(
+    PDRIVER_OBJECT DriverObject
+)
+/*++
+Routine Description:
+    Cleanup and free all allocated memory.
+Arguments:
+    DriverObject - the driver object created by the system.
+Return Value:
+    None.
+--*/
+{
+    UNREFERENCED_PARAMETER(DriverObject);
+
+    DEBUG("luks2flt!Unload called\n");
+
+    IRQL_ASSERT(PASSIVE_LEVEL);
+
+    ExDeleteLookasideListEx(&gReadContextList);
+}
+
+_Use_decl_annotations_
 NTSTATUS
 Luks2FltDispatchGeneric(
     PDEVICE_OBJECT DeviceObject,
@@ -209,7 +245,7 @@ Routine Description:
     or completes the request, marking it as invalid, depending on whether the IsLuks2Volume flag in the device extension is set.
 Arguments:
     DeviceObject - the device object for the target device.
-    IRP - the IRP desribing the requested IO operation.
+    Irp - the IRP desribing the requested IO operation.
 Return Value:
     If IsLuks2Volume is FALSE, the return value of Luks2FltDispatchPassthrough(); else the value of the appropriate LUKS2 dispatch routine
     or STATUS_INVALID_DEVICE_REQUEST.
@@ -223,6 +259,9 @@ Return Value:
     case IRP_MJ_CLOSE:
         if (DevExt->IsLuks2Volume)
             return Luks2FltDispatchCreateClose(DeviceObject, Irp);
+    case IRP_MJ_READ:
+        if (DevExt->IsLuks2Volume)
+            return Luks2FltDispatchRead(DeviceObject, Irp);
     case IRP_MJ_DEVICE_CONTROL:
         // as DispatchDeviceControl() already implements the logic for handling IOCTL_LUKS2FLT_SET_LUKS2_INFO requests
         // we also use it for non-LUKS2 volumes
@@ -231,6 +270,9 @@ Return Value:
     case IRP_MJ_CLEANUP:
         if (DevExt->IsLuks2Volume)
             return Luks2FltDispatchCleanup(DeviceObject, Irp);
+    case IRP_MJ_POWER:
+        if (DevExt->IsLuks2Volume)
+            return Luks2FltDispatchPower(DeviceObject, Irp);
     case IRP_MJ_PNP:
         // as DispatchPnp() already implements the logic for handling IRP_MN_REMOVE_DEVICE requests we also use it for non-LUKS2 volumes
         if ((DevExt->IsLuks2Volume) || ((Stack->MajorFunction == IRP_MJ_PNP) && (Stack->MinorFunction == IRP_MN_REMOVE_DEVICE)))
@@ -256,7 +298,7 @@ Routine Description:
     Dispatch routine that passes the received IRP on to the next driver in the stack, untouched.
 Arguments:
     DeviceObject - the device object for the target device.
-    IRP - the IRP desribing the requested IO operation.
+    Irp - the IRP desribing the requested IO operation.
 Return Value:
     The same as the returned value of the call to the driver of the next lower device.
 --*/
@@ -276,10 +318,10 @@ Luks2FltDispatchCreateClose(
 )
 /*++
 Routine Description:
-    Dispatch method for IRP_MJ_CREATE and IRP_MJ_CLOSE. Just calls DispatchPassthrough().
+    Dispatch routine for IRP_MJ_CREATE and IRP_MJ_CLOSE. Just calls DispatchPassthrough().
 Arguments:
     DeviceObject - the device object for the target device.
-    IRP - the IRP desribing the requested IO operation.
+    Irp - the IRP desribing the requested IO operation.
 Return Value:
     The same as the returned value of the call to the driver of the next lower device.
 --*/
@@ -310,18 +352,69 @@ Return Value:
 
 _Use_decl_annotations_
 NTSTATUS
+Luks2FltDispatchRead(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+)
+/*++
+Routine Description:
+    Dispatch routine for IRP_MJ_READ. Registers a completion routine for decrypting the read data
+    and passes the request down the device stack.
+Arguments:
+    DeviceObject - the device object for the target device.
+    Irp - the IRP desribing the requested IO operation.
+Return Value:
+    The same as the returned value of the call to the driver of the next lower device.
+--*/
+{
+    PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
+
+    // don't do anything if zero bytes shall be read
+    if (Stack->Parameters.Read.Length > 0) {
+        PLUKS2FLT_READ_CONTEXT Context = ExAllocateFromLookasideListEx(&gReadContextList);
+        if (Context == NULL) {
+            DEBUG("luks2flt!DispatchRead - ERROR: ExAllocateFromLookasideListEx returned NULL!\n");
+            return CompleteInvalidIrp(Irp);
+        }
+
+        Context->OrigByteOffset = Stack->Parameters.Read.ByteOffset.QuadPart;
+        Context->Length = Stack->Parameters.Read.Length;
+
+        IoCopyCurrentIrpStackLocationToNext(Irp);
+        Stack = IoGetNextIrpStackLocation(Irp);
+
+        // Move ByteOffset by the offset of the segment
+        Stack->Parameters.Read.ByteOffset.QuadPart = DevExt->Luks2Info.FirstSegmentSector * DevExt->Luks2Info.SectorSize;
+
+        IoSetCompletionRoutine(
+            Irp,
+            Luks2FltCompleteRead,
+            Context,
+            TRUE,
+            FALSE,
+            FALSE
+        );
+    }
+
+    return IoCallDriver(DevExt->NextLowerDevice, Irp);
+}
+
+_Use_decl_annotations_
+NTSTATUS
 Luks2FltDispatchDeviceControl(
     PDEVICE_OBJECT DeviceObject,
     PIRP Irp
 )
 /*++
 Routine Description:
-    Dispatch method for IRP_MJ_DEVICE_CONTROL. Handles IOCTL_LUKS2FLT_SET_LUKS2_INFO and fails all other IOCTLs.
+    Dispatch routine for IRP_MJ_DEVICE_CONTROL. Handles IOCTL_LUKS2FLT_SET_LUKS2_INFO and fails all other IOCTLs.
 Arguments:
     DeviceObject - the device object for the target device.
-    IRP - the IRP desribing the requested IO operation.
+    Irp - the IRP desribing the requested IO operation.
 Return Value:
-    STATUS_SUCCESS for IOCTL_LUKS2FLT_SET_LUKS2_INFO, STATUS_INVALID_DEVICE_REQUEST for all other IOCTLs.
+    STATUS_SUCCESS for IOCTL_LUKS2FLT_SET_LUKS2_INFO if the input buffer is big enough, STATUS_INVALID_DEVICE_REQUEST
+    for all other IOCTLs.
 --*/
 {
     PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
@@ -330,15 +423,23 @@ Return Value:
     if (Stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_LUKS2FLT_SET_LUKS2_INFO) {
         DEBUG("luks2flt!DispatchDeviceControl: DEBUG - got IOCTL_LUKS2FLT_SET_LUKS2_INFO\n");
 
+        if (Stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(LUKS2_VOLUME_INFO) + 1) {
+            DEBUG("luks2flt!DispatchDeviceControl: ERROR - InputBufferLength too small (less than sizeof(LUKS2_VOLUME_INFO) + 1)!\n");
+            return CompleteInvalidIrp(Irp);
+        }
+
         // the IOCTL uses buffered IO, therefore Buffer is a system buffer. this means it doesn't need to be locked and can be accessed directly
         PVOID Buffer = Irp->AssociatedIrp.SystemBuffer;
-        DevExt->IsLuks2Volume = ((PBOOLEAN)Buffer)[0];
+        // normalize value, just in case
+        DevExt->IsLuks2Volume = ((PBOOLEAN)Buffer)[0] ? TRUE : FALSE;
 
-        if (DevExt->IsLuks2Volume) {
-            DEBUG("luks2flt!DispatchDeviceControl: DEBUG - set IsLuks2Volume to TRUE\n");
-        } else {
-            DEBUG("luks2flt!DispatchDeviceControl: DEBUG - set IsLuks2Volume to FALSE\n");
-        }
+        DEBUG("luks2flt!DispatchDeviceControl: DEBUG - set IsLuks2Volume to %s\n", DevExt->IsLuks2Volume ? "TRUE" : "FALSE");
+
+        RtlCopyMemory(
+            &DevExt->Luks2Info,
+            ((PUINT8)Buffer) + 1,
+            sizeof(LUKS2_VOLUME_INFO)
+        );
 
         Irp->IoStatus.Status = STATUS_SUCCESS;
         Irp->IoStatus.Information = DevExt->IsLuks2Volume;
@@ -361,15 +462,37 @@ Luks2FltDispatchCleanup(
 )
 /*++
 Routine Description:
-    Dispatch method for IRP_MJ_CLEANUP. Just calls DispatchPassthrough().
+    Dispatch routine for IRP_MJ_CLEANUP. Just calls DispatchPassthrough().
 Arguments:
     DeviceObject - the device object for the target device.
-    IRP - the IRP desribing the requested IO operation.
+    Irp - the IRP desribing the requested IO operation.
 Return Value:
     The same as the returned value of the call to the driver of the next lower device.
 --*/
 {
     // The same reasoning as for IRP_MJ_CREATE and IRP_MJ_CLOSE applies.
+    return Luks2FltDispatchPassthrough(DeviceObject, Irp);
+}
+
+_Use_decl_annotations_
+NTSTATUS
+Luks2FltDispatchPower(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+)
+/*++
+Routine Description:
+    Dispatch routine for IRP_MJ_POWER. Just calls DispatchPassthrough().
+Arguments:
+    DeviceObject - the device object for the target device.
+    Irp - the IRP desribing the requested IO operation.
+Return Value:
+    The same as the returned value of the call to the driver of the next lower device.
+--*/
+{
+    // Decompiling the fvevol driver's FveFilterPower() routine shows that it does a lot of work in some cases,
+    // but we don't care about the volume's (or rather the underlying disk's) or the system's power state,
+    // so we ignore all power requests and just pass them down the stack.
     return Luks2FltDispatchPassthrough(DeviceObject, Irp);
 }
 
@@ -381,11 +504,11 @@ Luks2FltDispatchPnp(
 )
 /*++
 Routine Description:
-    Dispatch method for IRP_MJ_PNP. Calls DispatchPassthrough() and, if the minor function is IRP_MN_REMOVE_DEVICE,
+    Dispatch routine for IRP_MJ_PNP. Calls DispatchPassthrough() and, if the minor function is IRP_MN_REMOVE_DEVICE,
     detaches and deletes the device.
 Arguments:
     DeviceObject - the device object for the target device.
-    IRP - the IRP desribing the requested IO operation.
+    Irp - the IRP desribing the requested IO operation.
 Return Value:
     The same as the returned value of the call to the driver of the next lower device.
 --*/
@@ -431,25 +554,45 @@ Return Value:
 }
 
 _Use_decl_annotations_
-VOID
-Luks2FltUnload(
-    PDRIVER_OBJECT DriverObject
+NTSTATUS
+Luks2FltCompleteRead(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp,
+    PVOID Context
 )
 /*++
 Routine Description:
-    Cleanup and free all allocated memory.
+    Completion routine for IRP_MJ_READ that decrypts the read data.
 Arguments:
-    DriverObject - the driver object created by the system.
+    DeviceObject - the device object for the target device.
+    Irp - the IRP desribing the requested IO operation.
+    Context - a pointer that was set when registering the completion routine.
 Return Value:
-    None.
+    Always STATUS_SUCCESS.
 --*/
 {
-    UNREFERENCED_PARAMETER(DriverObject);
+    // this completion routine should only be registered to be called when the lower driver
+    // completed the IRP successfully
+    ASSERT(Irp->IoStatus.Status == STATUS_SUCCESS);
+    ASSERT(Context != NULL);
 
-    DEBUG("luks2flt!Unload called\n");
+    PLUKS2FLT_READ_CONTEXT Ctx = (PLUKS2FLT_READ_CONTEXT)Context;
+    PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PUINT8 Buffer = MmGetSystemAddressForMdlSafe(
+        Irp->MdlAddress,
+        NormalPagePriority | MdlMappingNoExecute
+    );
 
-    IRQL_ASSERT(PASSIVE_LEVEL);
-    // nothing to free yet
+    DecryptReadBuffer(
+        Buffer,
+        &DevExt->Luks2Info,
+        Ctx->OrigByteOffset,
+        Ctx->Length
+    );
+
+    ExFreeToLookasideListEx(&gReadContextList, Ctx);
+
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -470,4 +613,57 @@ Return Value:
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
 
     return STATUS_INVALID_DEVICE_REQUEST;
+}
+
+VOID
+DecryptReadBuffer(
+    _Inout_ PUINT8 Buffer,
+    _In_ PLUKS2_VOLUME_INFO VolInfo,
+    _In_ UINT64 OrigByteOffset,
+    _In_ UINT64 Length
+)
+/*++
+Routine Description:
+    Decrypts the data in p2pCtx->swappedBuffer using the information provided by p2pCtx->volCtx.
+
+Arguments:
+    p2pCtx - the context that Luks2FilterPostReadOperation received.
+
+Return Value:
+    None.
+--*/
+{
+    VOID(*InitCrypto)(PXTS, PUINT8);
+    VOID(*Decrypt)(PXTS, PUINT8, UINT64, PUINT8);
+
+    UINT64 Sector = OrigByteOffset / VolInfo->SectorSize;
+    UINT64 Offset = 0;
+    UINT8 Tweak[16];
+    XTS Xts;
+
+    DEBUG("luksflt!DecryptReadBuffer: DEBUG - decrypting data: Buffer=%p Sector=%llu\n", Buffer, Sector);
+
+    // TODO move xts initialization and function pointers for decrypting into volume info
+    // for better performance
+
+    switch (VolInfo->EncVariant) {
+    case AES_128_XTS:
+        InitCrypto = Aes128XtsInit;
+        Decrypt = Aes128XtsDecrypt;
+        break;
+    case AES_256_XTS:
+    default:
+        InitCrypto = Aes256XtsInit;
+        Decrypt = Aes256XtsDecrypt;
+        break;
+    }
+
+    InitCrypto(&Xts, VolInfo->Key);
+
+    while (Offset < Length) {
+        ToLeBytes(Sector, Tweak);
+        Decrypt(&Xts, Buffer + Offset, VolInfo->SectorSize, Tweak);
+        Offset += VolInfo->SectorSize;
+        Sector += 1;
+    }
 }
