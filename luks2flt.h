@@ -24,6 +24,7 @@ DRIVER_DISPATCH   Luks2FltDispatchPassthrough;
 DRIVER_DISPATCH   Luks2FltDispatchCreateClose;
 DRIVER_DISPATCH   Luks2FltDispatchDeviceControl;
 DRIVER_DISPATCH   Luks2FltDispatchCleanup;
+DRIVER_DISPATCH   Luks2FltDispatchPnp;
 
 NTSTATUS
 CompleteInvalidIrp(

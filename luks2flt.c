@@ -224,11 +224,17 @@ Return Value:
         if (DevExt->IsLuks2Volume)
             return Luks2FltDispatchCreateClose(DeviceObject, Irp);
     case IRP_MJ_DEVICE_CONTROL:
+        // as DispatchDeviceControl() already implements the logic for handling IOCTL_LUKS2FLT_SET_LUKS2_INFO requests
+        // we also use it for non-LUKS2 volumes
         if ((DevExt->IsLuks2Volume) || (Stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_LUKS2FLT_SET_LUKS2_INFO))
             return Luks2FltDispatchDeviceControl(DeviceObject, Irp);
     case IRP_MJ_CLEANUP:
         if (DevExt->IsLuks2Volume)
             return Luks2FltDispatchCleanup(DeviceObject, Irp);
+    case IRP_MJ_PNP:
+        // as DispatchPnp() already implements the logic for handling IRP_MN_REMOVE_DEVICE requests we also use it for non-LUKS2 volumes
+        if ((DevExt->IsLuks2Volume) || ((Stack->MajorFunction == IRP_MJ_PNP) && (Stack->MinorFunction == IRP_MN_REMOVE_DEVICE)))
+            return Luks2FltDispatchDeviceControl(DeviceObject, Irp);
     default:
         break;
     }
@@ -255,41 +261,11 @@ Return Value:
     The same as the returned value of the call to the driver of the next lower device.
 --*/
 {
-    NTSTATUS Status;
-    UCHAR MinorFunction;
-    PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
-    // suppress calls that happen *a lot*
-    //if ((stack->MajorFunction != IRP_MJ_CREATE) && (stack->MajorFunction != IRP_MJ_CLOSE) && (stack->MajorFunction != IRP_MJ_READ) &&
-    //    (stack->MajorFunction != IRP_MJ_WRITE) && (stack->MajorFunction != IRP_MJ_DEVICE_CONTROL) && (stack->MajorFunction != IRP_MJ_CLEANUP))
-    //    DEBUG("luks2flt!DispatchPassthrough called with major function=0x%02x, minor function=0x%02x\n", stack->MajorFunction, stack->MinorFunction);
-    MinorFunction = Stack->MinorFunction;
-
     PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
     // this is ok because we don't modify the IRP and don't register a completion routine. if we did
     // either of that, we'd have to use IoCopyCurrentIrpStackLocationToNext()
     IoSkipCurrentIrpStackLocation(Irp);
-    Status = IoCallDriver(DevExt->NextLowerDevice, Irp);
-
-    if (MinorFunction == IRP_MN_REMOVE_DEVICE) {
-        DEBUG("luks2flt!DispatchPassthrough: DEBUG - received IRP_MN_REMOVE_DEVICE for device object %p\n", DeviceObject);
-
-        // a DispatchPnp() routine should always be called at IRQL = PASSIVE_LEVEL, according to
-        // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/dispatch-routines-and-irqls,
-        // therefore we can detach the device and acquire the mutex
-        IoDetachDevice(DevExt->NextLowerDevice);
-
-        ExAcquireFastMutex(&gDeviceObjectCountMutex);
-        for (int i = 0; i < LUKS2FLT_MAX_DEVICES; ++i) {
-            if (gDeviceObjects[i] == DeviceObject) {
-                IoDeleteDevice(gDeviceObjects[i]);
-                gDeviceObjects[i] = NULL;
-                break;
-            }
-        }
-        ExReleaseFastMutex(&gDeviceObjectCountMutex);
-    }
-
-    return Status;
+    return IoCallDriver(DevExt->NextLowerDevice, Irp);
 }
 
 _Use_decl_annotations_
@@ -395,6 +371,63 @@ Return Value:
 {
     // The same reasoning as for IRP_MJ_CREATE and IRP_MJ_CLOSE applies.
     return Luks2FltDispatchPassthrough(DeviceObject, Irp);
+}
+
+_Use_decl_annotations_
+NTSTATUS
+Luks2FltDispatchPnp(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+)
+/*++
+Routine Description:
+    Dispatch method for IRP_MJ_PNP. Calls DispatchPassthrough() and, if the minor function is IRP_MN_REMOVE_DEVICE,
+    detaches and deletes the device.
+Arguments:
+    DeviceObject - the device object for the target device.
+    IRP - the IRP desribing the requested IO operation.
+Return Value:
+    The same as the returned value of the call to the driver of the next lower device.
+--*/
+{
+    NTSTATUS Status;
+    UCHAR MinorFunction;
+    PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
+    // I'm not sure what state the stack will be in and where exactly Stack will point to after IoCallDriver() returns
+    // so just save the minor function for checking whether it is IRP_MN_REMOVE_DEVICE after that call
+    MinorFunction = Stack->MinorFunction;
+
+    PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    // this is ok because we don't modify the IRP and don't register a completion routine. if we did
+    // either of that, we'd have to use IoCopyCurrentIrpStackLocationToNext()
+    IoSkipCurrentIrpStackLocation(Irp);
+    Status = IoCallDriver(DevExt->NextLowerDevice, Irp);
+
+    if (MinorFunction == IRP_MN_REMOVE_DEVICE) {
+        DEBUG("luks2flt!DispatchPnp: DEBUG - received IRP_MN_REMOVE_DEVICE for device object %p\n", DeviceObject);
+
+        // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/removing-a-device-in-a-filter-driver says
+        // "[a] filter driver follows essentially the same procedure as a function driver when removing a device", and
+        // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/removing-a-device-in-a-function-driver
+        // applied to this driver means detaching and deleting the device object.
+
+        // a DispatchPnp() routine should always be called at IRQL = PASSIVE_LEVEL, according to
+        // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/dispatch-routines-and-irqls,
+        // therefore we can detach the device and acquire the mutex
+        IoDetachDevice(DevExt->NextLowerDevice);
+
+        ExAcquireFastMutex(&gDeviceObjectCountMutex);
+        for (int i = 0; i < LUKS2FLT_MAX_DEVICES; ++i) {
+            if (gDeviceObjects[i] == DeviceObject) {
+                IoDeleteDevice(gDeviceObjects[i]);
+                gDeviceObjects[i] = NULL;
+                break;
+            }
+        }
+        ExReleaseFastMutex(&gDeviceObjectCountMutex);
+    }
+
+    return Status;
 }
 
 _Use_decl_annotations_
