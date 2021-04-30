@@ -14,6 +14,9 @@ UINT16 gDeviceObjectCount;
 // A lookaside sist used for (de)allocations of LUKS2FLT_READ_CONTEXTs. Must be aligned to 16 bytes.
 __declspec(align(16)) LOOKASIDE_LIST_EX gReadContextList;
 
+// A lookaside sist used for (de)allocations of LUKS2FLT_DEVICE_CONTROL_CONTEXTs. Must be aligned to 16 bytes.
+__declspec(align(16)) LOOKASIDE_LIST_EX gDeviceControlContextList;
+
 /* a FAST_MUTEX must be 8-byte aligned on 64-bit platforms, see
  * https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-exinitializefastmutex
  */
@@ -91,10 +94,23 @@ Return Value:
         &gReadContextList,
         NULL,
         NULL,
+        // the context allocated from this list is used in the read completion routine,
+        // which may be called at IRQL = DISPATCH_LEVEL, therefore we need non-paged memory
         NonPagedPoolNx,
         0,
         sizeof(LUKS2FLT_READ_CONTEXT),
         READCTX_TAG,
+        0
+    );
+    ExInitializeLookasideListEx(
+        &gDeviceControlContextList,
+        NULL,
+        NULL,
+        // see above
+        NonPagedPoolNx,
+        0,
+        sizeof(LUKS2FLT_DEVICE_CONTROL_CONTEXT),
+        DEVCTLCTX_TAG,
         0
     );
 
@@ -231,6 +247,7 @@ Return Value:
     IRQL_ASSERT(PASSIVE_LEVEL);
 
     ExDeleteLookasideListEx(&gReadContextList);
+    ExDeleteLookasideListEx(&gDeviceControlContextList);
 }
 
 _Use_decl_annotations_
@@ -241,14 +258,12 @@ Luks2FltDispatchGeneric(
 )
 /*++
 Routine Description:
-    Default dispatch routine that either calls Luks2FltDispatchPassthrough() or the appropriate routine for LUKS2 volumes
-    or completes the request, marking it as invalid, depending on whether the IsLuks2Volume flag in the device extension is set.
+    Default dispatch routine that either calls Luks2FltDispatchPassthrough() or the appropriate routine for LUKS2 volumes.
 Arguments:
     DeviceObject - the device object for the target device.
     Irp - the IRP desribing the requested IO operation.
 Return Value:
-    If IsLuks2Volume is FALSE, the return value of Luks2FltDispatchPassthrough(); else the value of the appropriate LUKS2 dispatch routine
-    or STATUS_INVALID_DEVICE_REQUEST.
+    If IsLuks2Volume is FALSE, the return value of Luks2FltDispatchPassthrough(); else the value of the appropriate LUKS2 dispatch routine.
 --*/
 {
     PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
@@ -262,10 +277,13 @@ Return Value:
     case IRP_MJ_READ:
         if (DevExt->IsLuks2Volume)
             return Luks2FltDispatchRead(DeviceObject, Irp);
+    case IRP_MJ_WRITE:
+        if (DevExt->IsLuks2Volume)
+            return Luks2FltDispatchWrite(DeviceObject, Irp);
     case IRP_MJ_DEVICE_CONTROL:
         // as DispatchDeviceControl() already implements the logic for handling IOCTL_LUKS2FLT_SET_LUKS2_INFO requests
         // we also use it for non-LUKS2 volumes
-        if ((DevExt->IsLuks2Volume) || (Stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_LUKS2FLT_SET_LUKS2_INFO))
+        if (DevExt->IsLuks2Volume || (Stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_DISK_SET_LUKS2_INFO))
             return Luks2FltDispatchDeviceControl(DeviceObject, Irp);
     case IRP_MJ_CLEANUP:
         if (DevExt->IsLuks2Volume)
@@ -275,16 +293,11 @@ Return Value:
             return Luks2FltDispatchPower(DeviceObject, Irp);
     case IRP_MJ_PNP:
         // as DispatchPnp() already implements the logic for handling IRP_MN_REMOVE_DEVICE requests we also use it for non-LUKS2 volumes
-        if ((DevExt->IsLuks2Volume) || ((Stack->MajorFunction == IRP_MJ_PNP) && (Stack->MinorFunction == IRP_MN_REMOVE_DEVICE)))
-            return Luks2FltDispatchDeviceControl(DeviceObject, Irp);
+        if (DevExt->IsLuks2Volume || (Stack->MinorFunction == IRP_MN_REMOVE_DEVICE))
+            return Luks2FltDispatchPnp(DeviceObject, Irp);
     default:
-        break;
+        return Luks2FltDispatchPassthrough(DeviceObject, Irp);
     }
-
-    if (DevExt->IsLuks2Volume) {
-        return CompleteInvalidIrp(Irp);
-    }
-    return Luks2FltDispatchPassthrough(DeviceObject, Irp);
 }
 
 _Use_decl_annotations_
@@ -375,17 +388,16 @@ Return Value:
         PLUKS2FLT_READ_CONTEXT Context = ExAllocateFromLookasideListEx(&gReadContextList);
         if (Context == NULL) {
             DEBUG("luks2flt!DispatchRead - ERROR: ExAllocateFromLookasideListEx returned NULL!\n");
-            return CompleteInvalidIrp(Irp);
+            return FailIrp(Irp, STATUS_INSUFFICIENT_RESOURCES);
         }
 
         Context->OrigByteOffset = Stack->Parameters.Read.ByteOffset.QuadPart;
-        Context->Length = Stack->Parameters.Read.Length;
 
         IoCopyCurrentIrpStackLocationToNext(Irp);
         Stack = IoGetNextIrpStackLocation(Irp);
 
         // Move ByteOffset by the offset of the segment
-        Stack->Parameters.Read.ByteOffset.QuadPart = DevExt->Luks2Info.FirstSegmentSector * DevExt->Luks2Info.SectorSize;
+        Stack->Parameters.Read.ByteOffset.QuadPart += DevExt->Luks2Info.FirstSegmentSector * DevExt->Luks2Info.SectorSize;
 
         IoSetCompletionRoutine(
             Irp,
@@ -395,6 +407,55 @@ Return Value:
             FALSE,
             FALSE
         );
+    } else {
+        IoSkipCurrentIrpStackLocation(Irp);
+    }
+
+    return IoCallDriver(DevExt->NextLowerDevice, Irp);
+}
+
+_Use_decl_annotations_
+NTSTATUS
+Luks2FltDispatchWrite(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+)
+/*++
+Routine Description:
+    Dispatch routine for IRP_MJ_WRITE. Encrypts the data before sending the request to the next lower
+    driver in the device stack.
+Arguments:
+    DeviceObject - the device object for the target device.
+    Irp - the IRP desribing the requested IO operation.
+Return Value:
+    The same as the returned value of the call to the driver of the next lower device.
+--*/
+{
+    PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
+
+    // don't do anything if zero bytes shall be read
+    if (Stack->Parameters.Write.Length > 0) {
+        IoCopyCurrentIrpStackLocationToNext(Irp);
+        Stack = IoGetNextIrpStackLocation(Irp);
+
+        PUINT8 Buffer = MmGetSystemAddressForMdlSafe(
+            Irp->MdlAddress,
+            NormalPagePriority | MdlMappingNoExecute
+        );
+
+        EncryptWriteBuffer(
+            Buffer,
+            &DevExt->Luks2Info,
+            &DevExt->Luks2Crypto,
+            Stack->Parameters.Write.ByteOffset.QuadPart,
+            Stack->Parameters.Write.Length
+        );
+
+        // Move ByteOffset by the offset of the segment
+        Stack->Parameters.Write.ByteOffset.QuadPart += DevExt->Luks2Info.FirstSegmentSector * DevExt->Luks2Info.SectorSize;
+    } else {
+        IoSkipCurrentIrpStackLocation(Irp);
     }
 
     return IoCallDriver(DevExt->NextLowerDevice, Irp);
@@ -408,28 +469,35 @@ Luks2FltDispatchDeviceControl(
 )
 /*++
 Routine Description:
-    Dispatch routine for IRP_MJ_DEVICE_CONTROL. Handles IOCTL_LUKS2FLT_SET_LUKS2_INFO and fails all other IOCTLs.
+    Dispatch routine for IRP_MJ_DEVICE_CONTROL. The action depends on the IOCTL of the request:
+    * IOCTL_DISK_SET_LUKS2_INFO requests are completed successfully.
+    * IOCTL_DISK_SET_PARTITION_INFO(_EX) requests are marked as invalid and completed.
+    * IOCTL_DISK_GET_PARTITION_INFO(_EX) requests have a completion routine registered.
+    * IRPs that have not been completed are passed on to the next lower driver.
 Arguments:
     DeviceObject - the device object for the target device.
     Irp - the IRP desribing the requested IO operation.
 Return Value:
-    STATUS_SUCCESS for IOCTL_LUKS2FLT_SET_LUKS2_INFO if the input buffer is big enough, STATUS_INVALID_DEVICE_REQUEST
-    for all other IOCTLs.
+    STATUS_SUCCESS for IOCTL_LUKS2FLT_SET_LUKS2_INFO if the input buffer is big enough (else STATUS_INVALID_DEVICE_REQUEST),
+    STATUS_INVALID_DEVICE_REQUEST for IOCTL_DISK_SET_PARTITION_INFO(_EX), the same as the returned value of the call to
+    the driver of the next lower device for all other IOCTLs.
 --*/
 {
     PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
     PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
 
-    if (Stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_LUKS2FLT_SET_LUKS2_INFO) {
+    switch (Stack->Parameters.DeviceIoControl.IoControlCode) {
+    case IOCTL_DISK_SET_LUKS2_INFO: {
         DEBUG("luks2flt!DispatchDeviceControl: DEBUG - got IOCTL_LUKS2FLT_SET_LUKS2_INFO\n");
-
-        if (Stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(LUKS2_VOLUME_INFO) + 1) {
-            DEBUG("luks2flt!DispatchDeviceControl: ERROR - InputBufferLength too small (less than sizeof(LUKS2_VOLUME_INFO) + 1)!\n");
-            return CompleteInvalidIrp(Irp);
-        }
 
         // the IOCTL uses buffered IO, therefore Buffer is a system buffer. this means it doesn't need to be locked and can be accessed directly
         PVOID Buffer = Irp->AssociatedIrp.SystemBuffer;
+
+        if (((PBOOLEAN)Buffer)[0] && (Stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(LUKS2_VOLUME_INFO) + 1)) {
+            DEBUG("luks2flt!DispatchDeviceControl: ERROR - InputBufferLength too small (less than sizeof(LUKS2_VOLUME_INFO) + 1)!\n");
+            return FailIrp(Irp, STATUS_BUFFER_TOO_SMALL);
+        }
+
         // normalize value, just in case
         DevExt->IsLuks2Volume = ((PBOOLEAN)Buffer)[0] ? TRUE : FALSE;
 
@@ -441,17 +509,57 @@ Return Value:
             sizeof(LUKS2_VOLUME_INFO)
         );
 
+        switch (DevExt->Luks2Info.EncVariant) {
+        case AES_128_XTS:
+             Aes128XtsInit(&DevExt->Luks2Crypto.Xts, DevExt->Luks2Info.Key);
+             DevExt->Luks2Crypto.Encrypt = Aes128XtsEncrypt;
+             DevExt->Luks2Crypto.Decrypt = Aes128XtsDecrypt;
+            break;
+        case AES_256_XTS:
+        default:
+            Aes256XtsInit(&DevExt->Luks2Crypto.Xts, DevExt->Luks2Info.Key);
+            DevExt->Luks2Crypto.Encrypt = Aes256XtsEncrypt;
+            DevExt->Luks2Crypto.Decrypt = Aes256XtsDecrypt;
+            break;
+        }
+
         Irp->IoStatus.Status = STATUS_SUCCESS;
         Irp->IoStatus.Information = DevExt->IsLuks2Volume;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
 
         return STATUS_SUCCESS;
     }
+    case IOCTL_DISK_SET_PARTITION_INFO:
+    case IOCTL_DISK_SET_PARTITION_INFO_EX: {
+        return FailIrp(Irp, STATUS_INVALID_DEVICE_REQUEST);
+    }
+    case IOCTL_DISK_GET_PARTITION_INFO:
+    case IOCTL_DISK_GET_PARTITION_INFO_EX: {
+        PLUKS2FLT_DEVICE_CONTROL_CONTEXT Context = ExAllocateFromLookasideListEx(&gDeviceControlContextList);
+        if (Context == NULL) {
+            DEBUG("luks2flt!DispatchDeviceControl - ERROR: ExAllocateFromLookasideListEx returned NULL!\n");
+            return FailIrp(Irp, STATUS_INSUFFICIENT_RESOURCES);
+        }
 
-    // TODO register completion routines for all IOCTLs that return information including volume size and location,
-    // i. e. IOCTL_DISK_GET_PARTITION_INFO(_EX), to modify the returned values and pass down all IRPs.
+        Context->Ioctl = Stack->Parameters.DeviceIoControl.IoControlCode;
+        Context->Buffer = Irp->AssociatedIrp.SystemBuffer;
 
-    return CompleteInvalidIrp(Irp);
+        IoCopyCurrentIrpStackLocationToNext(Irp);
+        IoSetCompletionRoutine(
+            Irp,
+            Luks2FltCompleteDeviceControl,
+            Context,
+            TRUE,
+            FALSE,
+            FALSE
+        );
+        break;
+    }
+    default:
+        IoSkipCurrentIrpStackLocation(Irp);
+    }
+
+    return IoCallDriver(DevExt->NextLowerDevice, Irp);
 }
 
 _Use_decl_annotations_
@@ -571,6 +679,9 @@ Return Value:
     Always STATUS_SUCCESS.
 --*/
 {
+    // as a completion routine this might be called at IRQL = DISPATCH_LEVEL which is why
+    // gReadContextList was initialized to allocate from non-paged memory
+
     // this completion routine should only be registered to be called when the lower driver
     // completed the IRP successfully
     ASSERT(Irp->IoStatus.Status == STATUS_SUCCESS);
@@ -578,6 +689,7 @@ Return Value:
 
     PLUKS2FLT_READ_CONTEXT Ctx = (PLUKS2FLT_READ_CONTEXT)Context;
     PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+
     PUINT8 Buffer = MmGetSystemAddressForMdlSafe(
         Irp->MdlAddress,
         NormalPagePriority | MdlMappingNoExecute
@@ -586,8 +698,9 @@ Return Value:
     DecryptReadBuffer(
         Buffer,
         &DevExt->Luks2Info,
+        &DevExt->Luks2Crypto,
         Ctx->OrigByteOffset,
-        Ctx->Length
+        Irp->IoStatus.Information
     );
 
     ExFreeToLookasideListEx(&gReadContextList, Ctx);
@@ -595,75 +708,205 @@ Return Value:
     return STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NTSTATUS
-CompleteInvalidIrp(
-    _In_ PIRP Irp
+Luks2FltCompleteDeviceControl(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp,
+    PVOID Context
 )
 /*++
 Routine Description:
-    Mark the given IRP as invalid and complete it.
+    Completion routine for IRP_MJ_DEVICE_CONTROL that modifies the partition info returned
+    by IOCTL_DISK_GET_PARTITION_INFO(_EX) and ignores all other IOCTLs.
+Arguments:
+    DeviceObject - the device object for the target device.
+    Irp - the IRP desribing the requested IO operation.
+    Context - a pointer that was set when registering the completion routine.
+Return Value:
+    Always STATUS_SUCCESS.
+--*/
+{
+    // as a completion routine this might be called at IRQL = DISPATCH_LEVEL which is why
+    // gReadContextList was initialized to allocate from non-paged memory
+
+    // this completion routine should only be registered to be called when the lower driver
+    // completed the IRP successfully
+    ASSERT(Irp->IoStatus.Status == STATUS_SUCCESS);
+    ASSERT(Context != NULL);
+
+    PLUKS2FLT_DEVICE_CONTROL_CONTEXT Ctx = (PLUKS2FLT_DEVICE_CONTROL_CONTEXT)Context;
+    PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+
+    switch (Ctx->Ioctl) {
+    case IOCTL_DISK_GET_PARTITION_INFO: {
+        PARTITION_INFORMATION PartInfo;
+        RtlCopyMemory(&PartInfo, Ctx->Buffer, sizeof(PartInfo));
+
+        DEBUG(
+            "luks2flt!CompleteDeviceControl: DEBUG - got PARTITION_INFORMATION { StartingOffset: %lld, PartitionLength: %lld, PartitionNumber: %lu, " \
+            "RewritePartition: %d }\n",
+            PartInfo.StartingOffset.QuadPart, PartInfo.PartitionLength.QuadPart, PartInfo.PartitionNumber, PartInfo.RewritePartition
+        );
+
+        PartInfo.StartingOffset.QuadPart += DevExt->Luks2Info.FirstSegmentSector * DevExt->Luks2Info.SectorSize;
+        PartInfo.PartitionLength.QuadPart = DevExt->Luks2Info.SegmentLength;
+        DEBUG(
+            "luks2flt!CompleteDeviceControl: DEBUG - Changed StartingOffset to %lld and PartitionLength to %lld\n",
+            PartInfo.StartingOffset.QuadPart,
+            PartInfo.PartitionLength.QuadPart
+        );
+        RtlCopyMemory(Ctx->Buffer, &PartInfo, sizeof(PartInfo));
+
+        break;
+    }
+    case IOCTL_DISK_GET_PARTITION_INFO_EX: {
+        PARTITION_INFORMATION_EX PartInfo;
+        RtlCopyMemory(&PartInfo, Ctx->Buffer, sizeof(PartInfo));
+
+        DEBUG(
+            "luks2flt!CompleteDeviceControl: DEBUG - got PARTITION_INFORMATION_EX { StartingOffset: %lld, PartitionLength: %lld, PartitionNumber: %lu, " \
+            "RewritePartition: %d, IsServicePartition: %d }\n",
+            PartInfo.StartingOffset.QuadPart, PartInfo.PartitionLength.QuadPart, PartInfo.PartitionNumber, PartInfo.RewritePartition, PartInfo.IsServicePartition
+        );
+
+        PartInfo.StartingOffset.QuadPart += DevExt->Luks2Info.FirstSegmentSector * DevExt->Luks2Info.SectorSize;
+        PartInfo.PartitionLength.QuadPart = DevExt->Luks2Info.SegmentLength;
+        DEBUG(
+            "luks2flt!CompleteDeviceControl: DEBUG - Changed StartingOffset to %lld and PartitionLength to %lld\n",
+            PartInfo.StartingOffset.QuadPart,
+            PartInfo.PartitionLength.QuadPart
+        );
+        RtlCopyMemory(Ctx->Buffer, &PartInfo, sizeof(PartInfo));
+
+        break;
+    }
+    default:
+        DEBUG("luks2flt!CompleteDeviceControl: ERROR - got unexpected IOCTL 0x%08x\n", Ctx->Ioctl);
+    }
+
+    ExFreeToLookasideListEx(&gDeviceControlContextList, Ctx);
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+FailIrp(
+    _In_ PIRP Irp,
+    _In_ NTSTATUS Status
+)
+/*++
+Routine Description:
+    Mark the given IRP with the given status and complete it.
 Arguments:
     Irp - the IRP to be completed.
+    Status - the Status to complete the IRP with.
 Return Value:
     Always STATUS_INVALID_DEVICE_REQUEST.
 --*/
 {
-    Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+    Irp->IoStatus.Status = Status;
     Irp->IoStatus.Information = 0;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
 
-    return STATUS_INVALID_DEVICE_REQUEST;
+    return Status;
 }
 
 VOID
 DecryptReadBuffer(
     _Inout_ PUINT8 Buffer,
     _In_ PLUKS2_VOLUME_INFO VolInfo,
+    _In_ PLUKS2_VOLUME_CRYPTO CryptoInfo,
     _In_ UINT64 OrigByteOffset,
     _In_ UINT64 Length
 )
 /*++
 Routine Description:
-    Decrypts the data in p2pCtx->swappedBuffer using the information provided by p2pCtx->volCtx.
-
+    Decrypt the data in the given buffer.
 Arguments:
-    p2pCtx - the context that Luks2FilterPostReadOperation received.
-
+    Buffer - the data to decrypt.
+    VolInfo - information about the volume needed to decrypt the data.
+    CryptoInfo - cryptographic helper structure for the volume.
+    OrigByteOffset - unmodified offset in the original read request.
+    Length - amount of data to decrypt.
 Return Value:
     None.
 --*/
 {
-    VOID(*InitCrypto)(PXTS, PUINT8);
-    VOID(*Decrypt)(PXTS, PUINT8, UINT64, PUINT8);
-
     UINT64 Sector = OrigByteOffset / VolInfo->SectorSize;
     UINT64 Offset = 0;
     UINT8 Tweak[16];
-    XTS Xts;
 
-    DEBUG("luksflt!DecryptReadBuffer: DEBUG - decrypting data: Buffer=%p Sector=%llu\n", Buffer, Sector);
-
-    // TODO move xts initialization and function pointers for decrypting into volume info
-    // for better performance
-
-    switch (VolInfo->EncVariant) {
-    case AES_128_XTS:
-        InitCrypto = Aes128XtsInit;
-        Decrypt = Aes128XtsDecrypt;
-        break;
-    case AES_256_XTS:
-    default:
-        InitCrypto = Aes256XtsInit;
-        Decrypt = Aes256XtsDecrypt;
-        break;
-    }
-
-    InitCrypto(&Xts, VolInfo->Key);
+    DEBUG("luksflt!DecryptReadBuffer: DEBUG - decrypting data: Buffer=%p Sector=%llu Length=%llu\n", Buffer, Sector, Length);
 
     while (Offset < Length) {
         ToLeBytes(Sector, Tweak);
-        Decrypt(&Xts, Buffer + Offset, VolInfo->SectorSize, Tweak);
+        CryptoInfo->Decrypt(&CryptoInfo->Xts, Buffer + Offset, VolInfo->SectorSize, Tweak);
         Offset += VolInfo->SectorSize;
         Sector += 1;
     }
+
+    // DumpBuffer(Buffer, Length);
+}
+
+VOID
+EncryptWriteBuffer(
+    _Inout_ PUINT8 Buffer,
+    _In_ PLUKS2_VOLUME_INFO VolInfo,
+    _In_ PLUKS2_VOLUME_CRYPTO CryptoInfo,
+    _In_ UINT64 OrigByteOffset,
+    _In_ UINT64 Length
+)
+/*++
+Routine Description:
+    Encrypt the data in the given buffer.
+Arguments:
+    Buffer - the data to encrypt.
+    VolInfo - information about the volume needed to encrypt the data.
+    CryptoInfo - cryptographic helper structure for the volume.
+    OrigByteOffset - unmodified offset in the original write request.
+    Length - amount of data to encrypt.
+Return Value:
+    None.
+--*/
+{
+    UINT64 Sector = OrigByteOffset / VolInfo->SectorSize;
+    UINT64 Offset = 0;
+    UINT8 Tweak[16];
+
+    DEBUG("luksflt!EncryptWriteBuffer: DEBUG - encrypting data: Buffer=%p Sector=%llu Length=%llu\n", Buffer, Sector, Length);
+
+    while (Offset < Length) {
+        ToLeBytes(Sector, Tweak);
+        CryptoInfo->Encrypt(&CryptoInfo->Xts, Buffer + Offset, VolInfo->SectorSize, Tweak);
+        Offset += VolInfo->SectorSize;
+        Sector += 1;
+    }
+
+    // DumpBuffer(Buffer, Length);
+}
+
+VOID
+DumpBuffer(
+    _In_ PUINT8 Buffer,
+    _In_ UINT64 Length
+)
+/*++
+Routine Description:
+    Dumps up to 1024 bytes from Buffer to the debug output.
+Arguments:
+    Buffer - the buffer to dump.
+    Length - bow many bytes to dump (values greater than 1024 are capped to 1024).
+Return Value:
+    None.
+--*/
+{
+    Length = min(Length, 1024);
+    DEBUG("luksflt!DumpBuffer: DEBUG - dumping buffer (%llu bytes):", Length);
+    for (UINT64 i = 0; i < Length; ++i) {
+        if ((i % 32) == 0)
+            DEBUG("\n\t");
+        DEBUG("%02x ", Buffer[i]);
+    }
+    DEBUG("\n");
 }

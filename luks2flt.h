@@ -2,6 +2,8 @@
 
 #include <immintrin.h> // for AES intrinsics
 #include <intrin.h> // for AES intrinsics
+#include <ntddk.h>
+#include <ntdddisk.h> // for various IOCTLs and PARTITION_INFORMATION(_EX)
 #include <wdm.h>
 
 /* === Constants and macros === */
@@ -13,47 +15,14 @@
 // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/defining-i-o-control-codes says the first value supplied
 // to CTL_CODE "must match the value that is set in the DeviceType member of the driver's DEVICE_OBJECT". the function code
 // is a random number between 0x800 and 0xFFF (as values below 0x800 are reserved for Microsoft).
-#define IOCTL_LUKS2FLT_SET_LUKS2_INFO CTL_CODE(FILE_DEVICE_DISK, 0xc38, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define IOCTL_DISK_SET_LUKS2_INFO CTL_CODE(FILE_DEVICE_DISK, 0x0c38, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+
 // memory allocation tags
 #define READCTX_TAG 'R2SL' // 'LS2R' backwards
+#define DEVCTLCTX_TAG 'D2SL' // 'LS2D' backwards
 
 /* === Type definitions === */
-// The two supported encryption algorithms for LUKS2 volumes.
-typedef enum _LUKS2_ENCRYPTION_VARIANT {
-    AES_128_XTS = 0,
-    AES_256_XTS = 1
-} LUKS2_ENCRYPTION_VARIANT, * PLUKS2_ENCRYPTION_VARIANT;
-
-// Information about a LUKS2 volume as provided with an IOCTL_LUKS2FLT_SET_LUKS2_INFO.
-typedef struct LUKS2_VOLUME_INFO {
-    // Sector size of the volume.
-    USHORT SectorSize;
-
-    // First sector of the LUKS2 segment (where the encrypted data is stored).
-    UINT64 FirstSegmentSector;
-
-    // Length of the LUKS2 segment in bytes.
-    UINT64 SegmentLength;
-
-    // Encryption algorithm used for the volume.
-    LUKS2_ENCRYPTION_VARIANT EncVariant;
-
-    // Master key of this volume. In case AES-128-XTS is used, only the first 32 bytes are used;
-    // AES-256-XTS uses all 64 bytes.
-    UINT8 Key[64];
-} LUKS2_VOLUME_INFO, * PLUKS2_VOLUME_INFO;
-
-typedef struct LUKS2FLT_DEVICE_EXTENSION {
-    PDEVICE_OBJECT NextLowerDevice;
-    BOOLEAN IsLuks2Volume;
-    LUKS2_VOLUME_INFO Luks2Info;
-} LUKS2FLT_DEVICE_EXTENSION, * PLUKS2FLT_DEVICE_EXTENSION;
-
-typedef struct _LUKS2FLT_READ_CONTEXT {
-    UINT64 OrigByteOffset;
-    UINT64 Length;
-} LUKS2FLT_READ_CONTEXT, * PLUKS2FLT_READ_CONTEXT;
-
 // AES(-XTS) types
 typedef struct _AES128 {
     __m128i EncryptKeys[11];
@@ -80,6 +49,74 @@ typedef union _XTS {
     struct _AES256_XTS Aes256;
 } XTS, * PXTS;
 
+// The two supported encryption algorithms for LUKS2 volumes.
+typedef enum _LUKS2_ENCRYPTION_VARIANT {
+    AES_128_XTS = 0,
+    AES_256_XTS = 1
+} LUKS2_ENCRYPTION_VARIANT, * PLUKS2_ENCRYPTION_VARIANT;
+
+// Information about a LUKS2 volume as provided with an IOCTL_LUKS2FLT_SET_LUKS2_INFO.
+typedef struct LUKS2_VOLUME_INFO {
+    // Sector size of the volume.
+    USHORT SectorSize;
+
+    // First sector of the LUKS2 segment (where the encrypted data is stored).
+    UINT64 FirstSegmentSector;
+
+    // Length of the LUKS2 segment in bytes.
+    UINT64 SegmentLength;
+
+    // Encryption algorithm used for the volume.
+    LUKS2_ENCRYPTION_VARIANT EncVariant;
+
+    // Master key of this volume. In case AES-128-XTS is used, only the first 32 bytes are used;
+    // AES-256-XTS uses all 64 bytes.
+    UINT8 Key[64];
+} LUKS2_VOLUME_INFO, * PLUKS2_VOLUME_INFO;
+
+// Cryptographic helper structure for a LUKS2 volumes.
+typedef struct _LUKS2_VOLUME_CRYPTO {
+    // XTS structure used for en-/decryption.
+    XTS Xts;
+
+    // Function to encrypt one sector using this struct's Xts member.
+    VOID(*Encrypt)(PXTS, PUINT8, UINT64, PUINT8);
+
+    // Function to decrypt one sector using this struct's Xts member.
+    VOID(*Decrypt)(PXTS, PUINT8, UINT64, PUINT8);
+} LUKS2_VOLUME_CRYPTO, * PLUKS2_VOLUME_CRYPTO;
+
+// Device extension for device objects created by this driver.
+typedef struct LUKS2FLT_DEVICE_EXTENSION {
+    // Pointer to the next lower device in the device stack the device is attached to.
+    PDEVICE_OBJECT NextLowerDevice;
+
+    // Flag for whether this is a LUKS2 volume. Set via IOCTL_DISK_SET_LUKS2_INFO.
+    BOOLEAN IsLuks2Volume;
+
+    // More information about the LUKS2 volume. Set via IOCTL_DISK_SET_LUKS2_INFO.
+    LUKS2_VOLUME_INFO Luks2Info;
+
+    // Cryptographic helper structure for the LUKS2 volume.
+    LUKS2_VOLUME_CRYPTO Luks2Crypto;
+} LUKS2FLT_DEVICE_EXTENSION, * PLUKS2FLT_DEVICE_EXTENSION;
+
+// Context that is passed to the IRP_MJ_READ completion routine.
+typedef struct _LUKS2FLT_READ_CONTEXT {
+    // Read offset of the original request so that the sector can be calculated
+    // (needed for decryption);
+    UINT64 OrigByteOffset;
+} LUKS2FLT_READ_CONTEXT, * PLUKS2FLT_READ_CONTEXT;
+
+// Context that is passed to the IRP_MJ_DEVICE_CONTROL completion routine.
+typedef struct _LUKS2FLT_DEVICE_CONTROL_CONTEXT {
+    // IOCTL of the request.
+    ULONG Ioctl;
+
+    // Set to thw value of Irp->AssociatedIrp.SystemBuffer.
+    PVOID Buffer;
+} LUKS2FLT_DEVICE_CONTROL_CONTEXT, * PLUKS2FLT_DEVICE_CONTROL_CONTEXT;
+
 /* === Driver routine declarations === */
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_ADD_DEVICE Luks2FltAddDevice;
@@ -90,23 +127,42 @@ DRIVER_DISPATCH   Luks2FltDispatchGeneric;
 DRIVER_DISPATCH   Luks2FltDispatchPassthrough;
 DRIVER_DISPATCH   Luks2FltDispatchCreateClose;
 DRIVER_DISPATCH   Luks2FltDispatchRead;
+DRIVER_DISPATCH   Luks2FltDispatchWrite;
 DRIVER_DISPATCH   Luks2FltDispatchDeviceControl;
 DRIVER_DISPATCH   Luks2FltDispatchCleanup;
 DRIVER_DISPATCH   Luks2FltDispatchPower;
 DRIVER_DISPATCH   Luks2FltDispatchPnp;
 
 IO_COMPLETION_ROUTINE Luks2FltCompleteRead;
+IO_COMPLETION_ROUTINE Luks2FltCompleteDeviceControl;
 
 NTSTATUS
-CompleteInvalidIrp(
-    _In_ PIRP Irp
+FailIrp(
+    _In_ PIRP Irp,
+    _In_ NTSTATUS Status
 );
 
 VOID
 DecryptReadBuffer(
     _Inout_ PUINT8 Buffer,
     _In_ PLUKS2_VOLUME_INFO VolInfo,
+    _In_ PLUKS2_VOLUME_CRYPTO CryptoInfo,
     _In_ UINT64 ByteOffset,
+    _In_ UINT64 Length
+);
+
+VOID
+EncryptWriteBuffer(
+    _Inout_ PUINT8 Buffer,
+    _In_ PLUKS2_VOLUME_INFO VolInfo,
+    _In_ PLUKS2_VOLUME_CRYPTO CryptoInfo,
+    _In_ UINT64 ByteOffset,
+    _In_ UINT64 Length
+);
+
+VOID
+DumpBuffer(
+    _In_ PUINT8 Buffer,
     _In_ UINT64 Length
 );
 

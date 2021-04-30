@@ -76,7 +76,7 @@ VOID XtsEncrypt(PXTS Xts, PUINT8 Sector, UINT64 SectorSize, PUINT8 Tweak, enum _
 	UINT64 NostealBlockCount = NeedStealing ? BlockCount - 1 : BlockCount;
 	for (UINT64 i = 0, c = 0; c < NostealBlockCount; i += 16, c += 1) {
 		Xor(Sector + i, Tweak);
-		DecryptBlock(Xts, Sector + i, AesVariant, Cipher1);
+		EncryptBlock(Xts, Sector + i, AesVariant, Cipher1);
 		Xor(Sector + i, Tweak);
 		GaloisField128MulLe(Tweak);
 	}
