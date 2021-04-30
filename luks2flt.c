@@ -471,9 +471,10 @@ Luks2FltDispatchDeviceControl(
 Routine Description:
     Dispatch routine for IRP_MJ_DEVICE_CONTROL. The action depends on the IOCTL of the request:
     * IOCTL_DISK_SET_LUKS2_INFO requests are completed successfully.
-    * IOCTL_DISK_SET_PARTITION_INFO(_EX) requests are marked as invalid and completed.
-    * IOCTL_DISK_GET_PARTITION_INFO(_EX) requests have a completion routine registered.
-    * IRPs that have not been completed are passed on to the next lower driver.
+    * IOCTL_DISK_GET_LENGTH_INFO, IOCTL_DISK_GET_PARTITION_INFO(_EX) and IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS requests have
+      a completion routine registered.
+    * Requests with a completion routine as well as a list of (supposedly) non-destructive IOCTLs are passed on to the next lower driver.
+    * All other requests are marked as invalid and completed.
 Arguments:
     DeviceObject - the device object for the target device.
     Irp - the IRP desribing the requested IO operation.
@@ -529,12 +530,10 @@ Return Value:
 
         return STATUS_SUCCESS;
     }
-    case IOCTL_DISK_SET_PARTITION_INFO:
-    case IOCTL_DISK_SET_PARTITION_INFO_EX: {
-        return FailIrp(Irp, STATUS_INVALID_DEVICE_REQUEST);
-    }
+    case IOCTL_DISK_GET_LENGTH_INFO:
     case IOCTL_DISK_GET_PARTITION_INFO:
-    case IOCTL_DISK_GET_PARTITION_INFO_EX: {
+    case IOCTL_DISK_GET_PARTITION_INFO_EX:
+    case IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: {
         PLUKS2FLT_DEVICE_CONTROL_CONTEXT Context = ExAllocateFromLookasideListEx(&gDeviceControlContextList);
         if (Context == NULL) {
             DEBUG("luks2flt!DispatchDeviceControl - ERROR: ExAllocateFromLookasideListEx returned NULL!\n");
@@ -555,8 +554,25 @@ Return Value:
         );
         break;
     }
-    default:
+    // a list of read-only (at least i think) ioctls i've seen in the wild before -
+    // allow them and block all others because atm there are issues with the partition
+    // getting corrupted
+    case IOCTL_DISK_GET_DRIVE_GEOMETRY:
+    case IOCTL_DISK_IS_WRITABLE:
+    case IOCTL_DISK_GET_DISK_ATTRIBUTES:
+    case IOCTL_STORAGE_GET_HOTPLUG_INFO:
+    case IOCTL_STORAGE_GET_DEVICE_NUMBER:
+    case IOCTL_STORAGE_QUERY_PROPERTY:
+    case IOCTL_MOUNTDEV_QUERY_DEVICE_NAME:
+    case IOCTL_MOUNTDEV_QUERY_STABLE_GUID:
+    case IOCTL_MOUNTDEV_QUERY_UNIQUE_ID:
+    case IOCTL_VOLUME_GET_GPT_ATTRIBUTES:
+    case IOCTL_VOLUME_IS_DYNAMIC:
         IoSkipCurrentIrpStackLocation(Irp);
+        break;
+    default:
+        DEBUG("luks2flt!DispatchDeviceControl: DEBUG - blocking IOCTL 0x%x\n", Stack->Parameters.DeviceIoControl.IoControlCode);
+        return FailIrp(Irp, STATUS_INVALID_DEVICE_REQUEST);
     }
 
     return IoCallDriver(DevExt->NextLowerDevice, Irp);
@@ -718,7 +734,8 @@ Luks2FltCompleteDeviceControl(
 /*++
 Routine Description:
     Completion routine for IRP_MJ_DEVICE_CONTROL that modifies the partition info returned
-    by IOCTL_DISK_GET_PARTITION_INFO(_EX) and ignores all other IOCTLs.
+    by IOCTL_DISK_GET_LENGTH_INFO, IOCTL_DISK_GET_PARTITION_INFO(_EX) and IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS
+    and ignores all other IOCTLs.
 Arguments:
     DeviceObject - the device object for the target device.
     Irp - the IRP desribing the requested IO operation.
@@ -740,49 +757,31 @@ Return Value:
 
     switch (Ctx->Ioctl) {
     case IOCTL_DISK_GET_PARTITION_INFO: {
-        PARTITION_INFORMATION PartInfo;
-        RtlCopyMemory(&PartInfo, Ctx->Buffer, sizeof(PartInfo));
-
-        DEBUG(
-            "luks2flt!CompleteDeviceControl: DEBUG - got PARTITION_INFORMATION { StartingOffset: %lld, PartitionLength: %lld, PartitionNumber: %lu, " \
-            "RewritePartition: %d }\n",
-            PartInfo.StartingOffset.QuadPart, PartInfo.PartitionLength.QuadPart, PartInfo.PartitionNumber, PartInfo.RewritePartition
-        );
-
-        PartInfo.StartingOffset.QuadPart += DevExt->Luks2Info.FirstSegmentSector * DevExt->Luks2Info.SectorSize;
-        PartInfo.PartitionLength.QuadPart = DevExt->Luks2Info.SegmentLength;
-        DEBUG(
-            "luks2flt!CompleteDeviceControl: DEBUG - Changed StartingOffset to %lld and PartitionLength to %lld\n",
-            PartInfo.StartingOffset.QuadPart,
-            PartInfo.PartitionLength.QuadPart
-        );
-        RtlCopyMemory(Ctx->Buffer, &PartInfo, sizeof(PartInfo));
-
+        PPARTITION_INFORMATION PartInfo = (PPARTITION_INFORMATION)Ctx->Buffer;
+        PartInfo->StartingOffset.QuadPart = DevExt->Luks2Info.FirstSegmentSector * DevExt->Luks2Info.SectorSize;
+        PartInfo->PartitionLength.QuadPart = DevExt->Luks2Info.SegmentLength;
         break;
     }
     case IOCTL_DISK_GET_PARTITION_INFO_EX: {
-        PARTITION_INFORMATION_EX PartInfo;
-        RtlCopyMemory(&PartInfo, Ctx->Buffer, sizeof(PartInfo));
-
-        DEBUG(
-            "luks2flt!CompleteDeviceControl: DEBUG - got PARTITION_INFORMATION_EX { StartingOffset: %lld, PartitionLength: %lld, PartitionNumber: %lu, " \
-            "RewritePartition: %d, IsServicePartition: %d }\n",
-            PartInfo.StartingOffset.QuadPart, PartInfo.PartitionLength.QuadPart, PartInfo.PartitionNumber, PartInfo.RewritePartition, PartInfo.IsServicePartition
-        );
-
-        PartInfo.StartingOffset.QuadPart += DevExt->Luks2Info.FirstSegmentSector * DevExt->Luks2Info.SectorSize;
-        PartInfo.PartitionLength.QuadPart = DevExt->Luks2Info.SegmentLength;
-        DEBUG(
-            "luks2flt!CompleteDeviceControl: DEBUG - Changed StartingOffset to %lld and PartitionLength to %lld\n",
-            PartInfo.StartingOffset.QuadPart,
-            PartInfo.PartitionLength.QuadPart
-        );
-        RtlCopyMemory(Ctx->Buffer, &PartInfo, sizeof(PartInfo));
-
+        PPARTITION_INFORMATION_EX PartInfo = (PPARTITION_INFORMATION_EX)Ctx->Buffer;
+        PartInfo->StartingOffset.QuadPart = DevExt->Luks2Info.FirstSegmentSector * DevExt->Luks2Info.SectorSize;
+        PartInfo->PartitionLength.QuadPart = DevExt->Luks2Info.SegmentLength;
+        break;
+    }
+    case IOCTL_DISK_GET_LENGTH_INFO: {
+        PGET_LENGTH_INFORMATION LengthInfo = (PGET_LENGTH_INFORMATION)Ctx->Buffer;
+        LengthInfo->Length.QuadPart = DevExt->Luks2Info.SegmentLength;
+        break;
+    }
+    case IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: {
+        PVOLUME_DISK_EXTENTS Extents = (PVOLUME_DISK_EXTENTS)Ctx->Buffer;
+        ASSERT(Extents->NumberOfDiskExtents == 1);
+        Extents->Extents[0].StartingOffset.QuadPart = DevExt->Luks2Info.FirstSegmentSector * DevExt->Luks2Info.SectorSize;
+        Extents->Extents[0].ExtentLength.QuadPart = DevExt->Luks2Info.SegmentLength;
         break;
     }
     default:
-        DEBUG("luks2flt!CompleteDeviceControl: ERROR - got unexpected IOCTL 0x%08x\n", Ctx->Ioctl);
+        DEBUG("luks2flt!CompleteDeviceControl: ERROR - got unexpected IOCTL 0x%x\n", Ctx->Ioctl);
     }
 
     ExFreeToLookasideListEx(&gDeviceControlContextList, Ctx);

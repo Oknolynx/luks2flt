@@ -4,6 +4,9 @@
 #include <intrin.h> // for AES intrinsics
 #include <ntddk.h>
 #include <ntdddisk.h> // for various IOCTLs and PARTITION_INFORMATION(_EX)
+#include <ntddvol.h> // for IOCTL_VOLUME_* IOCTLs
+#include <mountdev.h> // for IOCTL_MOUNTDEV_* IOCTLs
+#include <mountmgr.h> // for IOCTL_MOUNTDEV_* IOCTLs
 #include <wdm.h>
 
 /* === Constants and macros === */
