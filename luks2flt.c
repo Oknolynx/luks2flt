@@ -274,30 +274,50 @@ Return Value:
     case IRP_MJ_CLOSE:
         if (DevExt->IsLuks2Volume)
             return Luks2FltDispatchCreateClose(DeviceObject, Irp);
+        break;
     case IRP_MJ_READ:
         if (DevExt->IsLuks2Volume)
             return Luks2FltDispatchRead(DeviceObject, Irp);
+        break;
     case IRP_MJ_WRITE:
         if (DevExt->IsLuks2Volume)
-            return Luks2FltDispatchWrite(DeviceObject, Irp);
+            return FailIrp(Irp, STATUS_MEDIA_WRITE_PROTECTED);
+            // return Luks2FltDispatchWrite(DeviceObject, Irp);
+        break;
     case IRP_MJ_DEVICE_CONTROL:
         // as DispatchDeviceControl() already implements the logic for handling IOCTL_LUKS2FLT_SET_LUKS2_INFO requests
         // we also use it for non-LUKS2 volumes
         if (DevExt->IsLuks2Volume || (Stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_DISK_SET_LUKS2_INFO))
             return Luks2FltDispatchDeviceControl(DeviceObject, Irp);
+        break;
     case IRP_MJ_CLEANUP:
         if (DevExt->IsLuks2Volume)
             return Luks2FltDispatchCleanup(DeviceObject, Irp);
+        break;
     case IRP_MJ_POWER:
         if (DevExt->IsLuks2Volume)
             return Luks2FltDispatchPower(DeviceObject, Irp);
+        break;
     case IRP_MJ_PNP:
         // as DispatchPnp() already implements the logic for handling IRP_MN_REMOVE_DEVICE requests we also use it for non-LUKS2 volumes
         if (DevExt->IsLuks2Volume || (Stack->MinorFunction == IRP_MN_REMOVE_DEVICE))
             return Luks2FltDispatchPnp(DeviceObject, Irp);
-    default:
+        break;
+    /*
+    case IRP_MJ_QUERY_INFORMATION:
+    case IRP_MJ_QUERY_EA:
+    case IRP_MJ_QUERY_VOLUME_INFORMATION:
+    case IRP_MJ_QUERY_SECURITY:
+    case IRP_MJ_QUERY_QUOTA:
+    */
+    case IRP_MJ_FLUSH_BUFFERS:
+    case IRP_MJ_SHUTDOWN:
         return Luks2FltDispatchPassthrough(DeviceObject, Irp);
     }
+
+    if (DevExt->IsLuks2Volume)
+        return FailIrp(Irp, STATUS_INVALID_DEVICE_REQUEST);
+    return Luks2FltDispatchPassthrough(DeviceObject, Irp);
 }
 
 _Use_decl_annotations_
@@ -554,15 +574,17 @@ Return Value:
         );
         break;
     }
-    // a list of read-only (at least i think) ioctls i've seen in the wild before -
+    case IOCTL_DISK_IS_WRITABLE: {
+        return FailIrp(Irp, STATUS_MEDIA_WRITE_PROTECTED);
+    }
+    // a list of unrpoblematic (i think) ioctls i've seen in the wild before -
     // allow them and block all others because atm there are issues with the partition
     // getting corrupted
-    case IOCTL_DISK_GET_DRIVE_GEOMETRY:
-    case IOCTL_DISK_IS_WRITABLE:
-    case IOCTL_DISK_GET_DISK_ATTRIBUTES:
+    case IOCTL_DISK_GET_DRIVE_GEOMETRY: // this returns the geometry of the disk that the volume belongs to, not the geometry of the partition
+    //case IOCTL_DISK_GET_DISK_ATTRIBUTES:
     case IOCTL_STORAGE_GET_HOTPLUG_INFO:
     case IOCTL_STORAGE_GET_DEVICE_NUMBER:
-    case IOCTL_STORAGE_QUERY_PROPERTY:
+    //case IOCTL_STORAGE_QUERY_PROPERTY: // this is blocked a lot...
     case IOCTL_MOUNTDEV_QUERY_DEVICE_NAME:
     case IOCTL_MOUNTDEV_QUERY_STABLE_GUID:
     case IOCTL_MOUNTDEV_QUERY_UNIQUE_ID:
@@ -781,7 +803,7 @@ Return Value:
         break;
     }
     default:
-        DEBUG("luks2flt!CompleteDeviceControl: ERROR - got unexpected IOCTL 0x%x\n", Ctx->Ioctl);
+        DEBUG("luks2flt!CompleteDeviceControl: DEBUG - got unexpected IOCTL 0x%x\n", Ctx->Ioctl);
     }
 
     ExFreeToLookasideListEx(&gDeviceControlContextList, Ctx);
@@ -844,8 +866,6 @@ Return Value:
         Offset += VolInfo->SectorSize;
         Sector += 1;
     }
-
-    // DumpBuffer(Buffer, Length);
 }
 
 VOID
@@ -881,8 +901,6 @@ Return Value:
         Offset += VolInfo->SectorSize;
         Sector += 1;
     }
-
-    // DumpBuffer(Buffer, Length);
 }
 
 VOID
@@ -892,7 +910,7 @@ DumpBuffer(
 )
 /*++
 Routine Description:
-    Dumps up to 1024 bytes from Buffer to the debug output.
+    Dumps up to 4096 bytes from Buffer to the debug output.
 Arguments:
     Buffer - the buffer to dump.
     Length - bow many bytes to dump (values greater than 1024 are capped to 1024).
@@ -900,12 +918,17 @@ Return Value:
     None.
 --*/
 {
-    Length = min(Length, 1024);
+    // So that this also compiles without debugging enabled
+    UNREFERENCED_PARAMETER(Buffer);
+
+    Length = min(Length, 4096);
     DEBUG("luksflt!DumpBuffer: DEBUG - dumping buffer (%llu bytes):", Length);
     for (UINT64 i = 0; i < Length; ++i) {
+        if ((i != 0) && (i % 512) == 0)
+            DEBUG("\n");
         if ((i % 32) == 0)
             DEBUG("\n\t");
-        DEBUG("%02x ", Buffer[i]);
+        DEBUG("0x%02x, ", Buffer[i]);
     }
     DEBUG("\n");
 }

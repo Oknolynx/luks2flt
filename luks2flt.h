@@ -12,8 +12,13 @@
 /* === Constants and macros === */
 // the maximum number of device objects this driver may create
 #define LUKS2FLT_MAX_DEVICES 32
+//#define DO_DEBUG
+#ifdef DO_DEBUG
 // log everything as errors (for now) so that WinDbg must not be configured to show our messages
 #define DEBUG(...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, __VA_ARGS__)
+#else
+#define DEBUG(...)
+#endif
 #define IRQL_ASSERT(Irql) ASSERT(KeGetCurrentIrql() == Irql)
 // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/defining-i-o-control-codes says the first value supplied
 // to CTL_CODE "must match the value that is set in the DeviceType member of the driver's DEVICE_OBJECT". the function code
