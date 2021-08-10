@@ -66,7 +66,7 @@ typedef enum _LUKS2_ENCRYPTION_VARIANT {
 // Information about a LUKS2 volume as provided with an IOCTL_LUKS2FLT_SET_LUKS2_INFO.
 typedef struct LUKS2_VOLUME_INFO {
     // Sector size of the volume.
-    USHORT SectorSize;
+    UINT16 SectorSize;
 
     // First sector of the LUKS2 segment (where the encrypted data is stored).
     UINT64 FirstSegmentSector;
@@ -95,7 +95,7 @@ typedef struct _LUKS2_VOLUME_CRYPTO {
 } LUKS2_VOLUME_CRYPTO, * PLUKS2_VOLUME_CRYPTO;
 
 // Device extension for device objects created by this driver.
-typedef struct LUKS2FLT_DEVICE_EXTENSION {
+typedef struct _LUKS2FLT_DEVICE_EXTENSION {
     // Pointer to the next lower device in the device stack the device is attached to.
     PDEVICE_OBJECT NextLowerDevice;
 

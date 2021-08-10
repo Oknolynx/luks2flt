@@ -766,6 +766,8 @@ Return Value:
     Always STATUS_SUCCESS.
 --*/
 {
+    UNREFERENCED_PARAMETER(Irp);
+
     // as a completion routine this might be called at IRQL = DISPATCH_LEVEL which is why
     // gReadContextList was initialized to allocate from non-paged memory
 
