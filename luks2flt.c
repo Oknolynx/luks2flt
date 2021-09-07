@@ -512,36 +512,44 @@ Return Value:
         DEBUG("luks2flt!DispatchDeviceControl: DEBUG - got IOCTL_LUKS2FLT_SET_LUKS2_INFO\n");
 
         // the IOCTL uses buffered IO, therefore Buffer is a system buffer. this means it doesn't need to be locked and can be accessed directly
-        PVOID Buffer = Irp->AssociatedIrp.SystemBuffer;
+        PUINT8 Buffer = (PUINT8)Irp->AssociatedIrp.SystemBuffer;
 
-        if (((PBOOLEAN)Buffer)[0] && (Stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(LUKS2_VOLUME_INFO) + 1)) {
+        if (Buffer[0] && (Stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(LUKS2_VOLUME_INFO) + 1)) {
             DEBUG("luks2flt!DispatchDeviceControl: ERROR - InputBufferLength too small (less than sizeof(LUKS2_VOLUME_INFO) + 1)!\n");
             return FailIrp(Irp, STATUS_BUFFER_TOO_SMALL);
         }
 
         // normalize value, just in case
-        DevExt->IsLuks2Volume = ((PBOOLEAN)Buffer)[0] ? TRUE : FALSE;
+        DevExt->IsLuks2Volume = Buffer[0] ? TRUE : FALSE;
 
         DEBUG("luks2flt!DispatchDeviceControl: DEBUG - set IsLuks2Volume to %s\n", DevExt->IsLuks2Volume ? "TRUE" : "FALSE");
 
-        RtlCopyMemory(
-            &DevExt->Luks2Info,
-            ((PUINT8)Buffer) + 1,
-            sizeof(LUKS2_VOLUME_INFO)
-        );
+        if (DevExt->IsLuks2Volume) {
+            PLUKS2_VOLUME_INFO nDevExt = (PLUKS2_VOLUME_INFO)(Buffer + 1);
+            if ((nDevExt->EncVariant != AES_128_XTS) && (nDevExt->EncVariant != AES_256_XTS)) {
+                DEBUG("luks2flt!DispatchDeviceControl: DEBUG - message contains invalid encryption variant");
+                return FailIrp(Irp, STATUS_INVALID_PARAMETER);
+            }
 
-        switch (DevExt->Luks2Info.EncVariant) {
-        case AES_128_XTS:
-             Aes128XtsInit(&DevExt->Luks2Crypto.Xts, DevExt->Luks2Info.Key);
-             DevExt->Luks2Crypto.Encrypt = Aes128XtsEncrypt;
-             DevExt->Luks2Crypto.Decrypt = Aes128XtsDecrypt;
-            break;
-        case AES_256_XTS:
-        default:
-            Aes256XtsInit(&DevExt->Luks2Crypto.Xts, DevExt->Luks2Info.Key);
-            DevExt->Luks2Crypto.Encrypt = Aes256XtsEncrypt;
-            DevExt->Luks2Crypto.Decrypt = Aes256XtsDecrypt;
-            break;
+            RtlCopyMemory(
+                &DevExt->Luks2Info,
+                nDevExt,
+                sizeof(LUKS2_VOLUME_INFO)
+            );
+
+            switch (DevExt->Luks2Info.EncVariant) {
+            case AES_128_XTS:
+                 Aes128XtsInit(&DevExt->Luks2Crypto.Xts, DevExt->Luks2Info.Key);
+                 DevExt->Luks2Crypto.Encrypt = Aes128XtsEncrypt;
+                 DevExt->Luks2Crypto.Decrypt = Aes128XtsDecrypt;
+                break;
+            case AES_256_XTS:
+            default: // we already checked the validity of the parameter
+                Aes256XtsInit(&DevExt->Luks2Crypto.Xts, DevExt->Luks2Info.Key);
+                DevExt->Luks2Crypto.Encrypt = Aes256XtsEncrypt;
+                DevExt->Luks2Crypto.Decrypt = Aes256XtsDecrypt;
+                break;
+            }
         }
 
         Irp->IoStatus.Status = STATUS_SUCCESS;
@@ -820,12 +828,12 @@ FailIrp(
 )
 /*++
 Routine Description:
-    Mark the given IRP with the given status and complete it.
+    Mark the given IRP with the given status and complete it. Irp->IoStatus.Information is set to 0.
 Arguments:
     Irp - the IRP to be completed.
     Status - the Status to complete the IRP with.
 Return Value:
-    Always STATUS_INVALID_DEVICE_REQUEST.
+    The same status that was given as a parameter.
 --*/
 {
     Irp->IoStatus.Status = Status;
