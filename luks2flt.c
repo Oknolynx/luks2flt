@@ -258,51 +258,45 @@ Luks2FltDispatchGeneric(
 )
 /*++
 Routine Description:
-    Default dispatch routine that either calls Luks2FltDispatchPassthrough() or the appropriate routine for LUKS2 volumes.
+    Default dispatch routine that either calls Luks2FltDispatchPassthrough(), the appropriate routine for LUKS2 volumes, or
+    fails the IRP.
 Arguments:
     DeviceObject - the device object for the target device.
     Irp - the IRP desribing the requested IO operation.
 Return Value:
-    If IsLuks2Volume is FALSE, the return value of Luks2FltDispatchPassthrough(); else the value of the appropriate LUKS2 dispatch routine.
+    Either the return value of Luks2FltDispatchPassthrough(), the return value of the appropriate LUKS2 dispatch routine, or
+    STATUS_INVALID_DEVICE_REQUEST.
 --*/
 {
     PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
     PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
 
+    // fast path for non-LUKS2 volumes if not a DeviceIoControl IRP with code IOCTL_LUKS2FLT_SET_LUKS2_INFO
+    // and not a PnP IRP with code IRP_MN_REMOVE_DEVICE (as DispatchPnp() already implements the logic for
+    // handling these requests we also use it for non-LUKS2 volumes)
+    if (!DevExt->IsLuks2Volume &&
+        ((Stack->MajorFunction != IRP_MJ_DEVICE_CONTROL) || (Stack->Parameters.DeviceIoControl.IoControlCode != IOCTL_DISK_SET_LUKS2_INFO)) &&
+        ((Stack->MajorFunction != IRP_MJ_PNP) || (Stack->MinorFunction != IRP_MN_REMOVE_DEVICE)))
+        return Luks2FltDispatchPassthrough(DeviceObject, Irp);
+
     switch (Stack->MajorFunction) {
     case IRP_MJ_CREATE:
     case IRP_MJ_CLOSE:
-        if (DevExt->IsLuks2Volume)
-            return Luks2FltDispatchCreateClose(DeviceObject, Irp);
-        break;
+        return Luks2FltDispatchCreateClose(DeviceObject, Irp);
     case IRP_MJ_READ:
-        if (DevExt->IsLuks2Volume)
-            return Luks2FltDispatchRead(DeviceObject, Irp);
-        break;
+        return Luks2FltDispatchRead(DeviceObject, Irp);
+    /*
     case IRP_MJ_WRITE:
-        if (DevExt->IsLuks2Volume)
-            return FailIrp(Irp, STATUS_MEDIA_WRITE_PROTECTED);
-            // return Luks2FltDispatchWrite(DeviceObject, Irp);
-        break;
+        return Luks2FltDispatchWrite(DeviceObject, Irp);
+    */
     case IRP_MJ_DEVICE_CONTROL:
-        // as DispatchDeviceControl() already implements the logic for handling IOCTL_LUKS2FLT_SET_LUKS2_INFO requests
-        // we also use it for non-LUKS2 volumes
-        if (DevExt->IsLuks2Volume || (Stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_DISK_SET_LUKS2_INFO))
-            return Luks2FltDispatchDeviceControl(DeviceObject, Irp);
-        break;
+        return Luks2FltDispatchDeviceControl(DeviceObject, Irp);
     case IRP_MJ_CLEANUP:
-        if (DevExt->IsLuks2Volume)
-            return Luks2FltDispatchCleanup(DeviceObject, Irp);
-        break;
+        return Luks2FltDispatchCleanup(DeviceObject, Irp);
     case IRP_MJ_POWER:
-        if (DevExt->IsLuks2Volume)
-            return Luks2FltDispatchPower(DeviceObject, Irp);
-        break;
+        return Luks2FltDispatchPower(DeviceObject, Irp);
     case IRP_MJ_PNP:
-        // as DispatchPnp() already implements the logic for handling IRP_MN_REMOVE_DEVICE requests we also use it for non-LUKS2 volumes
-        if (DevExt->IsLuks2Volume || (Stack->MinorFunction == IRP_MN_REMOVE_DEVICE))
-            return Luks2FltDispatchPnp(DeviceObject, Irp);
-        break;
+        return Luks2FltDispatchPnp(DeviceObject, Irp);
     /*
     case IRP_MJ_QUERY_INFORMATION:
     case IRP_MJ_QUERY_EA:
@@ -315,9 +309,7 @@ Return Value:
         return Luks2FltDispatchPassthrough(DeviceObject, Irp);
     }
 
-    if (DevExt->IsLuks2Volume)
-        return FailIrp(Irp, STATUS_INVALID_DEVICE_REQUEST);
-    return Luks2FltDispatchPassthrough(DeviceObject, Irp);
+    return FailIrp(Irp, STATUS_INVALID_DEVICE_REQUEST);
 }
 
 _Use_decl_annotations_
