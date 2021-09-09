@@ -306,6 +306,7 @@ Return Value:
     */
     case IRP_MJ_FLUSH_BUFFERS:
     case IRP_MJ_SHUTDOWN:
+    case IRP_MJ_SYSTEM_CONTROL: // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/irp-mj-system-control
         return Luks2FltDispatchPassthrough(DeviceObject, Irp);
     }
 
@@ -725,6 +726,19 @@ Return Value:
     ASSERT(Irp->IoStatus.Status == STATUS_SUCCESS);
     ASSERT(Context != NULL);
 
+    // from https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-iomarkirppending:
+    // "If a driver sets an IoCompletion routine for an IRP and then passes the IRP down to a
+    // lower driver, the IoCompletion routine should check the IRP->PendingReturned flag. If the
+    // flag is set, the IoCompletion routine must call IoMarkIrpPending with the IRP. IoCompletion
+    // routines do not return STATUS_PENDING, however."
+    //
+    // In my debugging, the IRP was always marked as pending. Accessing it worked just fine. Therefore,
+    // we just call IoMarkPending, and then continue as normal.
+    if (Irp->PendingReturned) {
+        DEBUG("luks2flt!CompleteRead: DEBUG - the IRP was marked as pending, calling IoMarkIrpPending\n");
+        IoMarkIrpPending(Irp);
+    }
+
     PLUKS2FLT_READ_CONTEXT Ctx = (PLUKS2FLT_READ_CONTEXT)Context;
     PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
 
@@ -775,6 +789,12 @@ Return Value:
     // completed the IRP successfully
     ASSERT(Irp->IoStatus.Status == STATUS_SUCCESS);
     ASSERT(Context != NULL);
+
+    // see comment in Luks2FltCompleteRead
+    if (Irp->PendingReturned) {
+        DEBUG("luks2flt!CompleteDeviceControl: DEBUG - the IRP was marked as pending, calling IoMarkIrpPending\n");
+        IoMarkIrpPending(Irp);
+    }
 
     PLUKS2FLT_DEVICE_CONTROL_CONTEXT Ctx = (PLUKS2FLT_DEVICE_CONTROL_CONTEXT)Context;
     PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
