@@ -352,26 +352,13 @@ Return Value:
     The same as the returned value of the call to the driver of the next lower device.
 --*/
 {
-    // Regarding IRP_MJ_CREATE:
-    // https://docs.microsoft.com/en-us/windows-hardware/drivers/ifs/irp-mj-create says:
-    // "If the target device object is the filter driver's control device object, the filter driver's dispatch routine must complete the IRP
-    // and return an appropriate NTSTATUS value, after setting Irp->IoStatus.Status and Irp->IoStatus.Information to appropriate values.
-    //
-    // Otherwise, the filter driver should perform any needed processingand, depending on the nature of the filter, either complete the IRP
-    // or pass it down to the next - lower driver on the stack."
-    //
-    // However, I'm not sure what they mean by "the target device" -- the DeviceObject parameter is always a device object created by this driver
-    // and the device object in the IRP's stack location for this driver seems to always be the same object. As this driver does not support
-    // opening its devices, we just pass the request to the next lower driver -- either the request was not meant for us and we should pass it on
-    // or it was meant for us and the drivers below will notice that and fail the request.
-
-    // Regarding IRP_MJ_CLOSE:
-    // As we don't do anything for IRP_MJ_CREATE, we also just pass on IRP_MJ_CLOSE requests.
-
-    // Regarding both:
     // Decompiling the FveFilterCreate() and FveFilterClose() routines of the fvevol driver shows that (apart from some cases that are guarded
     // by checking values in the device extension and are thus out of my reach to understand) they also just pass create and close requests
     // down the stack. Therefore this should be fine.
+
+    // Side note: according to https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/handling-an-irp-mn-query-remove-device-request,
+    // we should fail any create requests as long as the device is in the remove-pending state. We rely on the lower-level drivers to do that,
+    // because this means we don't need to keep track whether the device is in that state.
 
     return Luks2FltDispatchPassthrough(DeviceObject, Irp);
 }
@@ -666,6 +653,55 @@ Return Value:
     // I'm not sure what state the stack will be in and where exactly Stack will point to after IoCallDriver() returns
     // so just save the minor function for checking whether it is IRP_MN_REMOVE_DEVICE after that call
     MinorFunction = Stack->MinorFunction;
+
+    // This is probably not needed (I didn't notice any problems when we didn't set the status to successful), but it
+    // also probably won't hurt to do what the docs say.
+    switch (MinorFunction) {
+    case IRP_MN_START_DEVICE: // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/irp-mn-start-device
+        DEBUG("luks2flt!DispatchPnp: DEBUG - received IRP_MN_START_DEVICE for device object %p\n", DeviceObject);
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        break;
+    case IRP_MN_QUERY_REMOVE_DEVICE: // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/handling-an-irp-mn-query-remove-device-request
+        DEBUG("luks2flt!DispatchPnp: DEBUG - received IRP_MN_QUERY_REMOVE_DEVICE for device object %p\n", DeviceObject);
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        break;
+    case IRP_MN_CANCEL_REMOVE_DEVICE: // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/irp-mn-cancel-remove-device
+        DEBUG("luks2flt!DispatchPnp: DEBUG - received IRP_MN_CANCEL_REMOVE_DEVICE for device object %p\n", DeviceObject);
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        break;
+    case IRP_MN_QUERY_STOP_DEVICE:
+        // from https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/handling-an-irp-mn-query-stop-device-request--windows-2000-and-later-:
+        // "A driver might fail a query-stop IRP if the following is true: The driver must not drop I/O requests and does
+        // not have a mechanism for queuing IRPs. While the device is in the stopped state, a driver must hold IRPs that
+        // require access to the device. If a driver does not queue IRPs, it must not allow the device to be stopped and
+        // thus must fail a query-stop IRP."
+        //
+        // We don't queue IRPs, instead we rely on the lower-level drivers to do this.
+        DEBUG("luks2flt!DispatchPnp: DEBUG - received IRP_MN_QUERY_STOP_DEVICE for device object %p\n", DeviceObject);
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        break;
+    case IRP_MN_CANCEL_STOP_DEVICE: // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/irp-mn-cancel-stop-device
+        DEBUG("luks2flt!DispatchPnp: DEBUG - received IRP_MN_CANCEL_STOP_DEVICE for device object %p\n", DeviceObject);
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        break;
+    case IRP_MN_STOP_DEVICE: // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/irp-mn-stop-device
+        DEBUG("luks2flt!DispatchPnp: DEBUG - received IRP_MN_STOP_DEVICE for device object %p\n", DeviceObject);
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        break;
+    case IRP_MN_DEVICE_USAGE_NOTIFICATION: // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/irp-mn-device-usage-notification
+        DEBUG("luks2flt!DispatchPnp: DEBUG - received IRP_MN_DEVICE_USAGE_NOTIFICATION for device object %p\n", DeviceObject);
+        // We don't care about tehc reation or deletion of paging, crash dump, or hibernation file on a volume. Let the
+        // other drivers in the device stack handle this.
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        break;
+    case IRP_MN_SURPRISE_REMOVAL: // https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/irp-mn-surprise-removal
+        // "Do not detach and delete the device object until the subsequent IRP_MN_REMOVE_DEVICE request."
+        DEBUG("luks2flt!DispatchPnp: DEBUG - received IRP_MN_SURPRISE_REMOVAL for device object %p\n", DeviceObject);
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        break;
+    default:
+        break;
+    }
 
     PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
     // this is ok because we don't modify the IRP and don't register a completion routine. if we did
