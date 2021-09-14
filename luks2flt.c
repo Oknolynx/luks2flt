@@ -524,6 +524,10 @@ Return Value:
                 nDevExt,
                 sizeof(LUKS2_VOLUME_INFO)
             );
+            RtlSecureZeroMemory(
+                nDevExt,
+                sizeof(LUKS2_VOLUME_INFO)
+            );
 
             switch (DevExt->Luks2Info.EncVariant) {
             case AES_128_XTS:
@@ -733,6 +737,7 @@ Return Value:
         ExAcquireFastMutex(&gDeviceObjectCountMutex);
         for (int i = 0; i < LUKS2FLT_MAX_DEVICES; ++i) {
             if (gDeviceObjects[i] == DeviceObject) {
+                RtlSecureZeroMemory(DeviceObject->DeviceExtension, sizeof(LUKS2FLT_DEVICE_EXTENSION));
                 IoDeleteDevice(gDeviceObjects[i]);
                 gDeviceObjects[i] = NULL;
                 break;
