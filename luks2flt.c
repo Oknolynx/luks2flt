@@ -439,10 +439,18 @@ Return Value:
         IoCopyCurrentIrpStackLocationToNext(Irp);
         Stack = IoGetNextIrpStackLocation(Irp);
 
-        PUINT8 Buffer = MmGetSystemAddressForMdlSafe(
-            Irp->MdlAddress,
-            NormalPagePriority | MdlMappingNoExecute
-        );
+        PUINT8 Buffer;
+        if (DeviceObject->Flags & DO_BUFFERED_IO) {
+            Buffer = Irp->AssociatedIrp.SystemBuffer;
+        } else {
+            if (Stack->Parameters.Write.Length > MmGetMdlByteCount(Irp->MdlAddress))
+                return FailIrp(Irp, STATUS_BUFFER_OVERFLOW);
+
+            Buffer = MmGetSystemAddressForMdlSafe(
+                Irp->MdlAddress,
+                NormalPagePriority | MdlMappingNoExecute
+            );
+        }
 
         EncryptWriteBuffer(
             Buffer,
@@ -778,10 +786,15 @@ Return Value:
     PLUKS2FLT_READ_CONTEXT Ctx = (PLUKS2FLT_READ_CONTEXT)Context;
     PLUKS2FLT_DEVICE_EXTENSION DevExt = (PLUKS2FLT_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
 
-    PUINT8 Buffer = MmGetSystemAddressForMdlSafe(
-        Irp->MdlAddress,
-        NormalPagePriority | MdlMappingNoExecute
-    );
+    PUINT8 Buffer;
+    if (DeviceObject->Flags & DO_BUFFERED_IO) {
+        Buffer = Irp->AssociatedIrp.SystemBuffer;
+    } else {
+        Buffer = MmGetSystemAddressForMdlSafe(
+            Irp->MdlAddress,
+            NormalPagePriority | MdlMappingNoExecute
+        );
+    }
 
     DecryptReadBuffer(
         Buffer,
